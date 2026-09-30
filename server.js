@@ -1,427 +1,308 @@
 var express = require('express');
 var multer = require('multer');
-var xlsx = require('xlsx');
 var cors = require('cors');
-var { PdfReader } = require('pdfreader');
+var ExcelJS = require('exceljs');
+var PdfReader = require('pdfreader').PdfReader;
 
 var app = express();
 app.use(cors());
 var upload = multer({ storage: multer.memoryStorage() });
 
-// Y coordinate ke basis pe rows group karo
-function groupByRows(items) {
-  var rows = {};
-  for (var i = 0; i < items.length; i++) {
-    var item = items[i];
-    var y = Math.round(item.y * 10) / 10;
-    if (!rows[y]) rows[y] = [];
-    rows[y].push(item);
-  }
-  
-  var sortedKeys = Object.keys(rows).sort(function(a, b) {
-    return parseFloat(a) - parseFloat(b);
+var GEMINI_KEY = process.env.GEMINI_API_KEY;
+var GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+
+// ---------- 1. PDF se rows nikalo ----------
+function readPdfRows(buffer, password) {
+  return new Promise(function(resolve, reject) {
+    var items = [];
+    var page = 0;
+    var opts = password ? { password: password } : {};
+    var reader = new PdfReader(opts);
+    reader.parseBuffer(buffer, function(err, item) {
+      if (err) return reject(err);
+      if (!item) return resolve(buildRows(items));
+      if (item.page) page = item.page;
+      if (item.text && item.text.trim()) {
+        items.push({ page: page, x: item.x, y: item.y, text: item.text.trim() });
+      }
+    });
   });
-  
-  var result = [];
-  for (var k = 0; k < sortedKeys.length; k++) {
-    var row = rows[sortedKeys[k]];
-    row.sort(function(a, b) { return a.x - b.x; });
-    result.push(row);
-  }
-  return result;
 }
 
-// Bank detect karo
-function detectBank(items) {
-  for (var i = 0; i < Math.min(items.length, 100); i++) {
-    var t = items[i].text.toUpperCase();
-    if (t.indexOf('ICICI') !== -1) return 'ICICI';
-    if (t.indexOf('INDUSIND') !== -1 || t.indexOf('INDUS IND') !== -1) return 'INDUSIND';
-    if (t.indexOf('BANK OF MAHARASHTRA') !== -1 || t.indexOf('MAHABANK') !== -1) return 'BOM';
-    if (t.indexOf('STATE BANK') !== -1 || t.indexOf('SBI') !== -1) return 'SBI';
-    if (t.indexOf('HDFC') !== -1) return 'HDFC';
-    if (t.indexOf('AXIS BANK') !== -1) return 'AXIS';
-    if (t.indexOf('KOTAK') !== -1) return 'KOTAK';
-    if (t.indexOf('YES BANK') !== -1) return 'YES';
-    if (t.indexOf('PUNJAB NATIONAL') !== -1 || t.indexOf('PNB') !== -1) return 'PNB';
-    if (t.indexOf('UNION BANK') !== -1) return 'UNION';
-    if (t.indexOf('CANARA') !== -1) return 'CANARA';
-    if (t.indexOf('BANK OF BARODA') !== -1 || t.indexOf('BOB') !== -1) return 'BOB';
-  }
-  return 'UNKNOWN';
-}
-
-// Date check karo
-function isDate(text) {
-  if (!text) return false;
-  var t = text.trim();
-  // DD/MM/YYYY
-  if (/^\d{2}\/\d{2}\/\d{4}$/.test(t)) return true;
-  // DD-MM-YYYY
-  if (/^\d{2}-\d{2}-\d{4}$/.test(t)) return true;
-  // DD-Mon-YYYY (01-May-2026)
-  if (/^\d{2}-[A-Za-z]{3}-\d{4}$/.test(t)) return true;
-  // DD Mon YYYY (01 May 2026)
-  if (/^\d{2}\s[A-Za-z]{3}\s\d{4}$/.test(t)) return true;
-  // DD/MM/YY
-  if (/^\d{2}\/\d{2}\/\d{2}$/.test(t)) return true;
-  // YYYY-MM-DD
-  if (/^\d{4}-\d{2}-\d{2}$/.test(t)) return true;
-  return false;
-}
-
-// Amount check karo
-function isAmount(text) {
-  if (!text) return false;
-  var t = text.trim().replace(/,/g, '');
-  return /^\d+\.\d{2}$/.test(t);
-}
-
-// Header row dhundho
-function findHeaderRow(rows) {
-  var keywords = ['DATE', 'NARRATION', 'PARTICULARS', 'DESCRIPTION', 
-                  'DEBIT', 'CREDIT', 'WITHDRAWAL', 'DEPOSIT', 
-                  'BALANCE', 'AMOUNT', 'TRANSACTION'];
-  
-  for (var i = 0; i < Math.min(rows.length, 50); i++) {
-    var rowText = '';
-    for (var j = 0; j < rows[i].length; j++) {
-      rowText += rows[i][j].text.toUpperCase() + ' ';
-    }
-    
-    var matchCount = 0;
-    for (var k = 0; k < keywords.length; k++) {
-      if (rowText.indexOf(keywords[k]) !== -1) matchCount++;
-    }
-    
-    if (matchCount >= 2) return i;
-  }
-  return -1;
-}
-
-// Column positions map karo header se
-function mapColumns(headerRow) {
-  var colMap = {
-    date: -1,
-    narration: -1,
-    debit: -1,
-    credit: -1,
-    balance: -1,
-    refNo: -1,
-    cheque: -1,
-    valueDate: -1
-  };
-  
-  for (var i = 0; i < headerRow.length; i++) {
-    var t = headerRow[i].text.toUpperCase();
-    var x = headerRow[i].x;
-    
-    if (t.indexOf('DATE') !== -1 && colMap.date === -1) colMap.date = x;
-    if ((t.indexOf('NARRATION') !== -1 || t.indexOf('PARTICULARS') !== -1 || 
-         t.indexOf('DESCRIPTION') !== -1) && colMap.narration === -1) colMap.narration = x;
-    if ((t.indexOf('DEBIT') !== -1 || t.indexOf('WITHDRAWAL') !== -1 || 
-         t.indexOf('DR') !== -1) && colMap.debit === -1) colMap.debit = x;
-    if ((t.indexOf('CREDIT') !== -1 || t.indexOf('DEPOSIT') !== -1 || 
-         t.indexOf('CR') !== -1) && colMap.credit === -1) colMap.credit = x;
-    if (t.indexOf('BALANCE') !== -1) colMap.balance = x;
-    if (t.indexOf('REF') !== -1 || t.indexOf('TRANSACTION ID') !== -1 || 
-        t.indexOf('CHEQUENO') !== -1) colMap.refNo = x;
-    if (t.indexOf('CHEQUE') !== -1 || t.indexOf('CHQ') !== -1) colMap.cheque = x;
-    if (t.indexOf('VALUE') !== -1) colMap.valueDate = x;
-  }
-  
-  return colMap;
-}
-
-// X position se column identify karo
-function getColumnByX(x, colMap, tolerance) {
-  tolerance = tolerance || 5;
-  
-  if (colMap.balance !== -1 && Math.abs(x - colMap.balance) < tolerance) return 'balance';
-  if (colMap.credit !== -1 && Math.abs(x - colMap.credit) < tolerance) return 'credit';
-  if (colMap.debit !== -1 && Math.abs(x - colMap.debit) < tolerance) return 'debit';
-  if (colMap.narration !== -1 && Math.abs(x - colMap.narration) < tolerance) return 'narration';
-  if (colMap.date !== -1 && Math.abs(x - colMap.date) < tolerance) return 'date';
-  if (colMap.refNo !== -1 && Math.abs(x - colMap.refNo) < tolerance) return 'refNo';
-  if (colMap.cheque !== -1 && Math.abs(x - colMap.cheque) < tolerance) return 'cheque';
-  if (colMap.valueDate !== -1 && Math.abs(x - colMap.valueDate) < tolerance) return 'valueDate';
-  
-  // Agar exact match nahi toh nearest column
-  var minDist = 999;
-  var nearest = 'narration';
-  var cols = Object.keys(colMap);
-  for (var c = 0; c < cols.length; c++) {
-    if (colMap[cols[c]] !== -1) {
-      var dist = Math.abs(x - colMap[cols[c]]);
-      if (dist < minDist) {
-        minDist = dist;
-        nearest = cols[c];
-      }
-    }
-  }
-  return nearest;
-}
-
-// Universal parse function
-function universalParse(items) {
-  var rows = groupByRows(items);
-  var headerIdx = findHeaderRow(rows);
-  
-  if (headerIdx === -1) {
-    // Fallback - date se dhundho
-    return fallbackParse(items);
-  }
-  
-  var colMap = mapColumns(rows[headerIdx]);
-  var transactions = [];
-  var currentTx = null;
-  
-  for (var i = headerIdx + 1; i < rows.length; i++) {
-    var row = rows[i];
-    if (!row || row.length === 0) continue;
-    
-    // Row ka pehla item check karo
-    var firstText = row[0].text.trim();
-    
-    // Naya transaction start hota hai jab date milti hai
-    if (isDate(firstText) || (row.length > 1 && isDate(row[1].text.trim()))) {
-      if (currentTx && currentTx.balance) {
-        transactions.push(currentTx);
-      }
-      
-      currentTx = {
-        date: '',
-        narration: '',
-        refNo: '',
-        chequeNo: '',
-        valueDate: '',
-        withdrawal: '',
-        deposit: '',
-        balance: ''
-      };
-      
-      // Row ke items ko columns mein daalo
-      for (var j = 0; j < row.length; j++) {
-        var item = row[j];
-        var t = item.text.trim();
-        var col = getColumnByX(item.x, colMap, 8);
-        
-        if (col === 'date' && isDate(t)) {
-          currentTx.date = t;
-        } else if (col === 'date' && isAmount(t)) {
-          // Date column mein amount aa gaya
-          assignAmount(currentTx, t);
-        } else if (col === 'narration' || col === 'date') {
-          if (!isDate(t) && !isAmount(t) && t.length > 1) {
-            currentTx.narration = currentTx.narration ? 
-              currentTx.narration + ' ' + t : t;
-          }
-        } else if (col === 'debit') {
-          if (isAmount(t)) currentTx.withdrawal = t;
-        } else if (col === 'credit') {
-          if (isAmount(t)) currentTx.deposit = t;
-        } else if (col === 'balance') {
-          if (isAmount(t)) currentTx.balance = t;
-        } else if (col === 'refNo') {
-          currentTx.refNo = t;
-        } else if (col === 'cheque') {
-          currentTx.chequeNo = t;
-        } else if (col === 'valueDate') {
-          if (isDate(t)) currentTx.valueDate = t;
-        } else {
-          // Unknown column - amount hai toh assign karo
-          if (isAmount(t)) assignAmount(currentTx, t);
-          else if (!isDate(t) && t.length > 1) {
-            currentTx.narration = currentTx.narration ? 
-              currentTx.narration + ' ' + t : t;
-          }
-        }
-      }
-      
-      if (!currentTx.date) currentTx.date = firstText;
-      
-    } else if (currentTx) {
-      // Continuation row — narration ya amount
-      for (var jj = 0; jj < row.length; jj++) {
-        var itm = row[jj];
-        var txt = itm.text.trim();
-        var column = getColumnByX(itm.x, colMap, 8);
-        
-        if (isAmount(txt)) {
-          if (column === 'debit') currentTx.withdrawal = txt;
-          else if (column === 'credit') currentTx.deposit = txt;
-          else if (column === 'balance') currentTx.balance = txt;
-          else assignAmount(currentTx, txt);
-        } else if (isDate(txt) && !currentTx.valueDate) {
-          currentTx.valueDate = txt;
-        } else if (txt.length > 1 && txt !== 'Dr' && txt !== 'Cr' && 
-                   txt !== 'DR' && txt !== 'CR') {
-          currentTx.narration = currentTx.narration ? 
-            currentTx.narration + ' ' + txt : txt;
-        }
-      }
-    }
-  }
-  
-  if (currentTx && currentTx.balance) {
-    transactions.push(currentTx);
-  }
-  
-  return transactions;
-}
-
-// Amount assign karo — balance pehle, phir deposit, phir withdrawal
-function assignAmount(tx, amount) {
-  if (!tx.balance) {
-    tx.balance = amount;
-  } else if (!tx.deposit && !tx.withdrawal) {
-    tx.deposit = tx.balance;
-    tx.balance = amount;
-  } else if (!tx.withdrawal) {
-    tx.withdrawal = tx.deposit;
-    tx.deposit = tx.balance;
-    tx.balance = amount;
-  }
-}
-
-// Fallback parser — sirf date aur amounts se
-function fallbackParse(items) {
-  var transactions = [];
-  var currentTx = null;
-  
+function buildRows(items) {
+  items.sort(function(a, b) {
+    if (a.page !== b.page) return a.page - b.page;
+    return a.y - b.y;
+  });
+  var rows = [];
+  var cur = null;
   for (var i = 0; i < items.length; i++) {
-    var t = items[i].text.trim();
-    
-    if (isDate(t)) {
-      if (currentTx && currentTx.balance) {
-        transactions.push(currentTx);
+    var it = items[i];
+    if (!cur || cur.page !== it.page || Math.abs(it.y - cur.y) > 0.4) {
+      cur = { page: it.page, y: it.y, cells: [] };
+      rows.push(cur);
+    }
+    cur.cells.push(it);
+  }
+  var lines = [];
+  for (var r = 0; r < rows.length; r++) {
+    rows[r].cells.sort(function(a, b) { return a.x - b.x; });
+    var parts = [];
+    for (var c = 0; c < rows[r].cells.length; c++) parts.push(rows[r].cells[c].text);
+    lines.push(parts.join(' | '));
+  }
+  return lines;
+}
+
+// ---------- 2. Gemini AI ----------
+var PROMPT =
+  'You are extracting data from an Indian bank statement. Each line below is one text row of the PDF, ' +
+  'cells separated by " | " in left-to-right order.\n' +
+  'Return ONLY JSON in this exact shape:\n' +
+  '{"info":{"bank":"","accountNo":"","holder":"","period":"","ifsc":"","micr":""},' +
+  '"transactions":[{"date":"","valueDate":"","narration":"","refNo":"","chqNo":"","withdrawal":null,"deposit":null,"balance":null,"category":""}]}\n' +
+  'Rules:\n' +
+  '- One object per transaction. If narration wraps onto several lines, join them into one narration.\n' +
+  '- Skip headers, footers, page numbers, opening balance, totals, summaries.\n' +
+  '- Numbers must be plain numbers without commas or currency (e.g. 54631.00 -> 54631).\n' +
+  '- withdrawal = money going out (Debit/Dr/Withdrawal). deposit = money coming in (Credit/Cr/Deposit). The other one must be null.\n' +
+  '- Use column headings and how the balance changes to decide debit or credit.\n' +
+  '- Keep dates exactly as written in the PDF.\n' +
+  '- category: one of UPI, IMPS, NEFT, RTGS, ATM, Cheque, Card, Salary, Interest, Charges, Transfer, Other.\n' +
+  '- Do not invent data. If something is missing use empty string or null.\n' +
+  '- If this text has no transactions, return an empty transactions array.\n\n' +
+  'TEXT:\n';
+
+function sleep(ms) {
+  return new Promise(function(r) { setTimeout(r, ms); });
+}
+
+async function askGemini(text) {
+  var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent';
+  var body = {
+    contents: [{ parts: [{ text: PROMPT + text }] }],
+    generationConfig: { temperature: 0, responseMimeType: 'application/json' }
+  };
+  var lastErr = null;
+  for (var attempt = 1; attempt <= 3; attempt++) {
+    try {
+      var resp = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
+        body: JSON.stringify(body)
+      });
+      if (resp.status === 429 || resp.status >= 500) {
+        lastErr = new Error('AI busy (' + resp.status + ')');
+        await sleep(4000 * attempt);
+        continue;
       }
-      currentTx = {
-        date: t,
-        narration: '',
-        refNo: '',
-        chequeNo: '',
-        valueDate: t,
-        withdrawal: '',
-        deposit: '',
-        balance: ''
-      };
-    } else if (currentTx) {
-      if (isAmount(t)) {
-        assignAmount(currentTx, t);
-      } else if (t.length > 2 && t !== 'Dr' && t !== 'Cr' && 
-                 t !== 'DR' && t !== 'CR') {
-        currentTx.narration = currentTx.narration ? 
-          currentTx.narration + ' ' + t : t;
+      var data = await resp.json();
+      if (!resp.ok) {
+        throw new Error('AI error: ' + ((data.error && data.error.message) || resp.status));
+      }
+      var out = data.candidates[0].content.parts[0].text;
+      return JSON.parse(out);
+    } catch (e) {
+      lastErr = e;
+      if (String(e.message).indexOf('AI error') === 0) throw e;
+      await sleep(2000 * attempt);
+    }
+  }
+  throw lastErr || new Error('AI failed');
+}
+
+async function runChunks(chunks) {
+  var results = new Array(chunks.length);
+  var next = 0;
+  async function worker() {
+    while (true) {
+      var idx = next;
+      next++;
+      if (idx >= chunks.length) return;
+      results[idx] = await askGemini(chunks[idx]);
+    }
+  }
+  var workers = [];
+  for (var w = 0; w < 3; w++) workers.push(worker());
+  await Promise.all(workers);
+  return results;
+}
+
+// ---------- 3. Safai + balance check ----------
+function toNum(v) {
+  if (v === null || v === undefined || v === '') return null;
+  var n = parseFloat(String(v).replace(/,/g, ''));
+  return isNaN(n) ? null : n;
+}
+
+function cleanTransactions(list) {
+  var out = [];
+  for (var i = 0; i < list.length; i++) {
+    var t = list[i];
+    if (!t || !t.date) continue;
+    var tx = {
+      date: String(t.date || ''),
+      valueDate: String(t.valueDate || ''),
+      narration: String(t.narration || ''),
+      refNo: String(t.refNo || ''),
+      chqNo: String(t.chqNo || ''),
+      category: String(t.category || ''),
+      withdrawal: toNum(t.withdrawal),
+      deposit: toNum(t.deposit),
+      balance: toNum(t.balance)
+    };
+    if (tx.withdrawal === null && tx.deposit === null && tx.balance === null) continue;
+    out.push(tx);
+  }
+  // balance se debit/credit verify karo
+  for (var j = 1; j < out.length; j++) {
+    var prev = out[j - 1].balance;
+    var cur = out[j];
+    if (prev === null || cur.balance === null) continue;
+    var amt = cur.withdrawal !== null ? cur.withdrawal : cur.deposit;
+    if (amt === null) continue;
+    var delta = Math.round((cur.balance - prev) * 100) / 100;
+    if (Math.abs(Math.abs(delta) - amt) < 0.02) {
+      if (delta > 0) { cur.deposit = amt; cur.withdrawal = null; }
+      else if (delta < 0) { cur.withdrawal = amt; cur.deposit = null; }
+    }
+  }
+  return out;
+}
+
+// ---------- 4. Excel ----------
+async function buildExcel(info, txs) {
+  var wb = new ExcelJS.Workbook();
+  var ws = wb.addWorksheet('Statement');
+  var GREEN = 'FF1B8A5A';
+  var LIGHT = 'FFEAF6F0';
+
+  ws.columns = [
+    { width: 7 }, { width: 13 }, { width: 50 }, { width: 13 }, { width: 18 },
+    { width: 12 }, { width: 13 }, { width: 16 }, { width: 16 }, { width: 16 }
+  ];
+
+  ws.mergeCells('A1:J1');
+  var title = ws.getCell('A1');
+  title.value = 'ACCOUNT STATEMENT';
+  title.font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
+  title.alignment = { horizontal: 'center', vertical: 'middle' };
+  title.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GREEN } };
+  ws.getRow(1).height = 28;
+
+  var infoRows = [
+    ['Bank', info.bank || ''],
+    ['Account', (info.accountNo || '') + (info.holder ? '  (' + info.holder + ')' : '')],
+    ['Period', info.period || ''],
+    ['IFSC', info.ifsc || ''],
+    ['MICR', info.micr || '']
+  ];
+  for (var i = 0; i < infoRows.length; i++) {
+    var rn = i + 2;
+    ws.getCell('A' + rn).value = infoRows[i][0];
+    ws.getCell('A' + rn).font = { bold: true };
+    ws.mergeCells('A' + rn + ':B' + rn);
+    ws.getCell('C' + rn).value = infoRows[i][1];
+    ws.mergeCells('C' + rn + ':F' + rn);
+  }
+
+  var headerRowNo = 8;
+  var heads = ['S.No', 'Date', 'Narration', 'Category', 'Ref No.', 'Chq No.', 'Value Date', 'Withdrawal (₹)', 'Deposit (₹)', 'Balance (₹)'];
+  var hr = ws.getRow(headerRowNo);
+  for (var h = 0; h < heads.length; h++) {
+    var cell = hr.getCell(h + 1);
+    cell.value = heads[h];
+    cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GREEN } };
+    cell.alignment = { horizontal: 'center', vertical: 'middle' };
+  }
+  hr.height = 22;
+
+  for (var k = 0; k < txs.length; k++) {
+    var t = txs[k];
+    var row = ws.getRow(headerRowNo + 1 + k);
+    row.getCell(1).value = k + 1;
+    row.getCell(2).value = t.date;
+    row.getCell(3).value = t.narration;
+    row.getCell(4).value = t.category;
+    row.getCell(5).value = t.refNo;
+    row.getCell(6).value = t.chqNo;
+    row.getCell(7).value = t.valueDate || t.date;
+    row.getCell(8).value = t.withdrawal;
+    row.getCell(9).value = t.deposit;
+    row.getCell(10).value = t.balance;
+    row.getCell(3).alignment = { wrapText: true, vertical: 'top' };
+    for (var c = 8; c <= 10; c++) row.getCell(c).numFmt = '#,##0.00';
+    if (k % 2 === 1) {
+      for (var cc = 1; cc <= 10; cc++) {
+        row.getCell(cc).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: LIGHT } };
       }
     }
   }
-  
-  if (currentTx && currentTx.balance) {
-    transactions.push(currentTx);
-  }
-  
-  return transactions;
+  ws.views = [{ state: 'frozen', ySplit: headerRowNo }];
+  return await wb.xlsx.writeBuffer();
 }
 
-function buildExcel(transactions, bankName) {
-  var wb = xlsx.utils.book_new();
-  var wsData = [];
-
-  wsData.push(['ACCOUNT STATEMENT - ' + bankName]);
-  wsData.push([]);
-  wsData.push([
-    'S.No', 'Date', 'Narration', 'Category', 
-    'Ref No.', 'Chq No.', 'Value Date', 
-    'Withdrawal (₹)', 'Deposit (₹)', 'Balance (₹)'
-  ]);
-
-  for (var i = 0; i < transactions.length; i++) {
-    var t = transactions[i];
-    wsData.push([
-      i + 1,
-      t.date,
-      t.narration,
-      '',
-      t.refNo || '',
-      t.chequeNo || '',
-      t.valueDate || t.date,
-      t.withdrawal || '',
-      t.deposit || '',
-      t.balance || ''
-    ]);
-  }
-
-  var ws = xlsx.utils.aoa_to_sheet(wsData);
-  
-  // Column widths
-  ws['!cols'] = [
-    { wch: 5 },  // S.No
-    { wch: 12 }, // Date
-    { wch: 40 }, // Narration
-    { wch: 12 }, // Category
-    { wch: 15 }, // Ref No
-    { wch: 12 }, // Chq No
-    { wch: 12 }, // Value Date
-    { wch: 15 }, // Withdrawal
-    { wch: 15 }, // Deposit
-    { wch: 15 }  // Balance
-  ];
-  
-  xlsx.utils.book_append_sheet(wb, ws, 'Statement');
-  return xlsx.write(wb, { type: 'buffer', bookType: 'xlsx' });
-}
-
+// ---------- 5. Routes ----------
 app.get('/', function(req, res) {
-  res.send('BankSync Pro Backend Running!');
+  res.send('BankSync Pro Backend Running! AI key set: ' + (GEMINI_KEY ? 'YES' : 'NO'));
 });
 
-app.post('/convert', upload.single('pdf'), function(req, res) {
-  if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded' });
-  }
+app.post('/convert', upload.single('pdf'), async function(req, res) {
+  try {
+    if (!req.file) return res.status(400).json({ error: 'No file uploaded' });
+    if (!GEMINI_KEY) return res.status(500).json({ error: 'Server me GEMINI_API_KEY set nahi hai' });
 
-  var items = [];
-  var reader = new PdfReader();
-  var responded = false;
-
-  reader.parseBuffer(req.file.buffer, function(err, item) {
-    if (responded) return;
-    
-    if (err) {
-      responded = true;
-      return res.status(500).json({ error: 'PDF read error: ' + err.message });
-    }
-
-    if (!item) {
-      responded = true;
-      var bank = detectBank(items);
-      var transactions = universalParse(items);
-
-      if (transactions.length === 0) {
-        return res.status(400).json({ 
-          error: 'No transactions found. Bank: ' + bank + 
-                 '. Please check if PDF is text-based (not scanned image).' 
-        });
+    var password = (req.body && req.body.password) || '';
+    var lines;
+    try {
+      lines = await readPdfRows(req.file.buffer, password);
+    } catch (e) {
+      var m = String(e && e.message ? e.message : e).toLowerCase();
+      if (m.indexOf('password') !== -1) {
+        return res.status(400).json({ error: 'PDF password galat hai ya password chahiye' });
       }
-
-      var excelBuffer = buildExcel(transactions, bank);
-      res.setHeader('Content-Type', 
-        'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-      res.setHeader('Content-Disposition', 
-        'attachment; filename="statement.xlsx"');
-      return res.send(excelBuffer);
+      return res.status(400).json({ error: 'PDF read nahi hui: ' + (e.message || e) });
     }
 
-    if (item.text) {
-      items.push({ 
-        text: item.text, 
-        x: item.x, 
-        y: item.y, 
-        page: item.page 
-      });
+    if (!lines.length) {
+      return res.status(400).json({ error: 'PDF me text nahi mila. Scanned image PDF support nahi hai.' });
     }
-  });
+
+    var CHUNK = 150;
+    var chunks = [];
+    for (var i = 0; i < lines.length; i += CHUNK) {
+      chunks.push(lines.slice(i, i + CHUNK).join('\n'));
+    }
+
+    var results = await runChunks(chunks);
+
+    var info = {};
+    var all = [];
+    for (var r = 0; r < results.length; r++) {
+      var res1 = results[r] || {};
+      if (res1.info) {
+        var keys = Object.keys(res1.info);
+        for (var k = 0; k < keys.length; k++) {
+          if (res1.info[keys[k]] && !info[keys[k]]) info[keys[k]] = res1.info[keys[k]];
+        }
+      }
+      if (res1.transactions) all = all.concat(res1.transactions);
+    }
+
+    var txs = cleanTransactions(all);
+    if (!txs.length) {
+      return res.status(400).json({ error: 'Transactions nahi mile. PDF check karo.' });
+    }
+
+    var buf = await buildExcel(info, txs);
+    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+    res.setHeader('Content-Disposition', 'attachment; filename="statement.xlsx"');
+    return res.send(Buffer.from(buf));
+  } catch (e) {
+    console.log('Convert error:', e);
+    return res.status(500).json({ error: String(e.message || e) });
+  }
 });
 
 var PORT = process.env.PORT || 3000;
