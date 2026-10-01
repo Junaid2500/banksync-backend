@@ -9,7 +9,54 @@ app.use(cors());
 var upload = multer({ storage: multer.memoryStorage() });
 
 var GEMINI_KEY = process.env.GEMINI_API_KEY;
-var GEMINI_MODEL = process.env.GEMINI_MODEL || 'gemini-2.0-flash';
+var GEMINI_MODEL = process.env.GEMINI_MODEL || '';
+var cachedModel = '';
+
+// ---------- Model khud chuno ----------
+async function pickModel() {
+  if (GEMINI_MODEL) return GEMINI_MODEL;
+  if (cachedModel) return cachedModel;
+
+  var resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', {
+    headers: { 'x-goog-api-key': GEMINI_KEY }
+  });
+  var data = await resp.json();
+  if (!resp.ok) {
+    throw new Error('AI error: ' + ((data.error && data.error.message) || resp.status));
+  }
+  var list = data.models || [];
+  var best = '';
+  var bestVer = -1;
+
+  for (var i = 0; i < list.length; i++) {
+    var name = String(list[i].name || '').replace('models/', '');
+    var methods = list[i].supportedGenerationMethods || [];
+    if (methods.indexOf('generateContent') === -1) continue;
+    var m = name.match(/^gemini-(\d+(?:\.\d+)?)-flash$/);
+    if (m) {
+      var ver = parseFloat(m[1]);
+      if (ver > bestVer) { bestVer = ver; best = name; }
+    }
+  }
+
+  // Agar seedha naam na mile to koi bhi flash model
+  if (!best) {
+    for (var j = 0; j < list.length; j++) {
+      var n2 = String(list[j].name || '').replace('models/', '');
+      var m2 = list[j].supportedGenerationMethods || [];
+      if (m2.indexOf('generateContent') === -1) continue;
+      if (n2.indexOf('flash') === -1) continue;
+      if (/lite|image|tts|live|audio|thinking|exp/.test(n2)) continue;
+      best = n2;
+      break;
+    }
+  }
+
+  if (!best) throw new Error('AI error: koi Flash model nahi mila');
+  console.log('Using model:', best);
+  cachedModel = best;
+  return best;
+}
 
 // ---------- 1. PDF se rows nikalo ----------
 function readPdfRows(buffer, password) {
@@ -78,28 +125,48 @@ function sleep(ms) {
 }
 
 async function askGemini(text) {
-  var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + GEMINI_MODEL + ':generateContent';
   var body = {
     contents: [{ parts: [{ text: PROMPT + text }] }],
     generationConfig: { temperature: 0, responseMimeType: 'application/json' }
   };
   var lastErr = null;
+
   for (var attempt = 1; attempt <= 3; attempt++) {
     try {
+      var modelName = await pickModel();
+      var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + modelName + ':generateContent';
       var resp = await fetch(url, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', 'x-goog-api-key': GEMINI_KEY },
         body: JSON.stringify(body)
       });
+
       if (resp.status === 429 || resp.status >= 500) {
         lastErr = new Error('AI busy (' + resp.status + ')');
         await sleep(4000 * attempt);
         continue;
       }
+
       var data = await resp.json();
+
       if (!resp.ok) {
-        throw new Error('AI error: ' + ((data.error && data.error.message) || resp.status));
+        var msg = (data.error && data.error.message) || String(resp.status);
+        // Model purana/galat hai to auto-pick pe aa jao
+        if (resp.status === 404 || /no longer available|not found/i.test(msg)) {
+          GEMINI_MODEL = '';
+          cachedModel = '';
+          lastErr = new Error('AI error: ' + msg);
+          continue;
+        }
+        throw new Error('AI error: ' + msg);
       }
+
+      if (!data.candidates || !data.candidates[0] || !data.candidates[0].content) {
+        lastErr = new Error('AI error: khali jawab aaya');
+        await sleep(2000 * attempt);
+        continue;
+      }
+
       var out = data.candidates[0].content.parts[0].text;
       return JSON.parse(out);
     } catch (e) {
@@ -154,7 +221,6 @@ function cleanTransactions(list) {
     if (tx.withdrawal === null && tx.deposit === null && tx.balance === null) continue;
     out.push(tx);
   }
-  // balance se debit/credit verify karo
   for (var j = 1; j < out.length; j++) {
     var prev = out[j - 1].balance;
     var cur = out[j];
