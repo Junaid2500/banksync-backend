@@ -9,13 +9,15 @@ app.use(cors());
 var upload = multer({ storage: multer.memoryStorage() });
 
 var GEMINI_KEY = process.env.GEMINI_API_KEY;
-var GEMINI_MODEL = process.env.GEMINI_MODEL || '';
-var cachedModel = '';
+var modelList = [];
 
-// ---------- Model khud chuno ----------
-async function pickModel() {
-  if (GEMINI_MODEL) return GEMINI_MODEL;
-  if (cachedModel) return cachedModel;
+function sleep(ms) {
+  return new Promise(function(r) { setTimeout(r, ms); });
+}
+
+// ---------- Google se Flash models ki list ----------
+async function listModels() {
+  if (modelList.length) return modelList;
 
   var resp = await fetch('https://generativelanguage.googleapis.com/v1beta/models?pageSize=200', {
     headers: { 'x-goog-api-key': GEMINI_KEY }
@@ -24,38 +26,35 @@ async function pickModel() {
   if (!resp.ok) {
     throw new Error('AI error: ' + ((data.error && data.error.message) || resp.status));
   }
-  var list = data.models || [];
-  var best = '';
-  var bestVer = -1;
 
+  var found = [];
+  var list = data.models || [];
   for (var i = 0; i < list.length; i++) {
     var name = String(list[i].name || '').replace('models/', '');
     var methods = list[i].supportedGenerationMethods || [];
     if (methods.indexOf('generateContent') === -1) continue;
-    var m = name.match(/^gemini-(\d+(?:\.\d+)?)-flash$/);
-    if (m) {
-      var ver = parseFloat(m[1]);
-      if (ver > bestVer) { bestVer = ver; best = name; }
-    }
+    if (name.indexOf('flash') === -1) continue;
+    if (/image|tts|live|audio|thinking|exp/.test(name)) continue;
+    var m = name.match(/gemini-(\d+(?:\.\d+)?)/);
+    found.push({
+      name: name,
+      ver: m ? parseFloat(m[1]) : 0,
+      preview: name.indexOf('preview') !== -1
+    });
   }
 
-  // Agar seedha naam na mile to koi bhi flash model
-  if (!best) {
-    for (var j = 0; j < list.length; j++) {
-      var n2 = String(list[j].name || '').replace('models/', '');
-      var m2 = list[j].supportedGenerationMethods || [];
-      if (m2.indexOf('generateContent') === -1) continue;
-      if (n2.indexOf('flash') === -1) continue;
-      if (/lite|image|tts|live|audio|thinking|exp/.test(n2)) continue;
-      best = n2;
-      break;
-    }
-  }
+  found.sort(function(a, b) {
+    if (a.preview !== b.preview) return a.preview ? 1 : -1;
+    return b.ver - a.ver;
+  });
 
-  if (!best) throw new Error('AI error: koi Flash model nahi mila');
-  console.log('Using model:', best);
-  cachedModel = best;
-  return best;
+  var names = [];
+  for (var j = 0; j < found.length && j < 4; j++) names.push(found[j].name);
+  if (!names.length) throw new Error('AI error: koi Flash model nahi mila');
+
+  console.log('Models:', names.join(', '));
+  modelList = names;
+  return names;
 }
 
 // ---------- 1. PDF se rows nikalo ----------
@@ -120,8 +119,19 @@ var PROMPT =
   '- If this text has no transactions, return an empty transactions array.\n\n' +
   'TEXT:\n';
 
-function sleep(ms) {
-  return new Promise(function(r) { setTimeout(r, ms); });
+function retryWaitMs(data, attempt) {
+  var wait = 8000 * attempt;
+  try {
+    var details = (data && data.error && data.error.details) || [];
+    for (var i = 0; i < details.length; i++) {
+      if (details[i].retryDelay) {
+        var s = parseFloat(String(details[i].retryDelay));
+        if (!isNaN(s)) wait = Math.ceil(s * 1000) + 1000;
+      }
+    }
+  } catch (e) {}
+  if (wait > 60000) wait = 60000;
+  return wait;
 }
 
 async function askGemini(text) {
@@ -131,9 +141,10 @@ async function askGemini(text) {
   };
   var lastErr = null;
 
-  for (var attempt = 1; attempt <= 3; attempt++) {
+  for (var attempt = 1; attempt <= 6; attempt++) {
     try {
-      var modelName = await pickModel();
+      var models = await listModels();
+      var modelName = models[(attempt - 1) % models.length];
       var url = 'https://generativelanguage.googleapis.com/v1beta/models/' + modelName + ':generateContent';
       var resp = await fetch(url, {
         method: 'POST',
@@ -141,20 +152,21 @@ async function askGemini(text) {
         body: JSON.stringify(body)
       });
 
+      var data = {};
+      try { data = await resp.json(); } catch (e1) {}
+
       if (resp.status === 429 || resp.status >= 500) {
-        lastErr = new Error('AI busy (' + resp.status + ')');
-        await sleep(4000 * attempt);
+        var gmsg = (data.error && data.error.message) || '';
+        lastErr = new Error('AI error: Google ne ' + resp.status + ' diya (model: ' + modelName + '). ' + gmsg.slice(0, 250));
+        console.log('Retry', attempt, modelName, resp.status, gmsg.slice(0, 200));
+        await sleep(retryWaitMs(data, attempt));
         continue;
       }
 
-      var data = await resp.json();
-
       if (!resp.ok) {
         var msg = (data.error && data.error.message) || String(resp.status);
-        // Model purana/galat hai to auto-pick pe aa jao
         if (resp.status === 404 || /no longer available|not found/i.test(msg)) {
-          GEMINI_MODEL = '';
-          cachedModel = '';
+          modelList = [];
           lastErr = new Error('AI error: ' + msg);
           continue;
         }
@@ -179,19 +191,10 @@ async function askGemini(text) {
 }
 
 async function runChunks(chunks) {
-  var results = new Array(chunks.length);
-  var next = 0;
-  async function worker() {
-    while (true) {
-      var idx = next;
-      next++;
-      if (idx >= chunks.length) return;
-      results[idx] = await askGemini(chunks[idx]);
-    }
+  var results = [];
+  for (var i = 0; i < chunks.length; i++) {
+    results.push(await askGemini(chunks[i]));
   }
-  var workers = [];
-  for (var w = 0; w < 3; w++) workers.push(worker());
-  await Promise.all(workers);
   return results;
 }
 
@@ -335,7 +338,7 @@ app.post('/convert', upload.single('pdf'), async function(req, res) {
       return res.status(400).json({ error: 'PDF me text nahi mila. Scanned image PDF support nahi hai.' });
     }
 
-    var CHUNK = 150;
+    var CHUNK = 100;
     var chunks = [];
     for (var i = 0; i < lines.length; i += CHUNK) {
       chunks.push(lines.slice(i, i + CHUNK).join('\n'));
