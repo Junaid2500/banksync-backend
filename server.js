@@ -8,651 +8,616 @@ var app = express();
 app.use(cors());
 var upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 1024 * 1024 } });
 
-// ================= PDF se items =================
+var MONEY_RE = /^\(?-?₹?\s?\d[\d,]*\.\d{2}\)?\s?(?:dr|cr)?\.?$/i;
+var DATE_RE = /^(?:\d{1,2}[-\/. ](?:\d{1,2}|[A-Za-z]{3,9})[-\/. ,']*\d{2,4}|\d{4}-\d{2}-\d{2})$/;
+var STACK_RE = /^\d{1,2}[-\/ ][A-Za-z]{3,9}[-\/ ]?$/;
+var STOP_RE = /(generated on|page\s+\d+\s+of|closing balance|opening balance|statement summary|total\s+(debit|credit|withdrawal|deposit)|grand total|end of statement|computer generated|registered office|legends?\s*:)/i;
+var HDR_RE = /\b(s\.?\s?no|sl\.?\s?no|transaction|txn|date|cheque|chq|description|narration|particulars|details|withdrawals?|deposits?|debit|credit|balance|available|amount|ref|dr|cr)\b/gi;
+
+function r2(x) { return Math.round(x * 100) / 100; }
+
+function num(t) {
+  var s = String(t).replace(/[₹,\s]/g, '').replace(/(dr|cr)\.?$/i, '');
+  var neg = /^\(.*\)$/.test(s) || s.charAt(0) === '-';
+  s = s.replace(/[()\-]/g, '');
+  var v = parseFloat(s);
+  if (isNaN(v)) v = 0;
+  return neg ? -v : v;
+}
+
+function balOf(t) {
+  var v = num(t);
+  if (/dr\.?$/i.test(String(t).trim())) v = -Math.abs(v);
+  return v;
+}
+
+/* ---------- PDF read ---------- */
 function readItems(buffer, password) {
-  return new Promise(function(resolve, reject) {
+  return new Promise(function (resolve, reject) {
     var items = [];
     var page = 0;
-    var done = false;
-    var reader = new PdfReader(password ? { password: password } : {});
-    reader.parseBuffer(buffer, function(err, item) {
-      if (done) return;
-      if (err) { done = true; return reject(err); }
-      if (!item) { done = true; return resolve(items); }
-      if (item.page) page = item.page;
+    var opts = password ? { password: password } : {};
+    var reader = new PdfReader(opts);
+    reader.parseBuffer(buffer, function (err, item) {
+      if (err) { reject(err); return; }
+      if (!item) { resolve(items); return; }
+      if (item.page) { page = item.page; return; }
       if (item.text !== undefined && String(item.text).trim() !== '') {
-        var tx = String(item.text).trim();
-        items.push({ page: page, x: item.x, y: item.y, w: item.w || (tx.length * 0.5), text: tx });
+        items.push({ page: page, x: item.x, y: item.y, w: item.w || 0, text: String(item.text).trim() });
       }
     });
   });
 }
 
-// ================= Helpers =================
-var DATE_RES = [
-  /^\d{1,2}[\/\-.]\d{1,2}[\/\-.]\d{2,4}$/,
-  /^\d{1,2}[\-\/ ][A-Za-z]{3,9}[\-\/ ,']*\d{2,4}$/,
-  /^\d{4}-\d{2}-\d{2}$/
-];
-function isDate(t) {
-  for (var i = 0; i < DATE_RES.length; i++) {
-    if (DATE_RES[i].test(t)) return true;
-  }
-  return false;
-}
-
-var AMT_RE = /^\(?-?[\d,]*\d\.\d{1,2}\)?\s*(Dr|Cr)?\.?$/i;
-function isAmountText(t) {
-  if (isDate(t)) return false;
-  return AMT_RE.test(t);
-}
-function parseAmt(t) {
-  var m = t.match(/(Dr|Cr)\.?$/i);
-  var suffix = m ? m[1].toLowerCase() : '';
-  var num = parseFloat(t.replace(/[^0-9.]/g, ''));
-  if (isNaN(num)) num = 0;
-  return { num: num, suffix: suffix };
-}
-function round2(n) { return Math.round(n * 100) / 100; }
-
-// "01-May-" aur neeche "2026" alag alag line mein ho to jod do
+/* "01-May-" + "2026" (neeche wali line) ko jodta hai */
 function stackDates(items) {
   var used = {};
-  var p1 = /^\d{1,2}[\-\/ ][A-Za-z]{3,9}[\-\/ ]?$/;
-  var p2 = /^\d{1,2}[\/\-.]\d{1,2}[\/\-.]$/;
-  for (var i = 0; i < items.length; i++) {
+  var i, j;
+  for (i = 0; i < items.length; i++) {
     var a = items[i];
-    if (used[i]) continue;
-    if (!(p1.test(a.text) || p2.test(a.text))) continue;
-    var ac = a.x + a.w / 2;
-    for (var j = 0; j < items.length; j++) {
-      if (j === i || used[j]) continue;
+    if (!STACK_RE.test(a.text)) continue;
+    for (j = 0; j < items.length; j++) {
       var b = items[j];
-      if (b.page !== a.page) continue;
-      if (!/^\d{2,4}$/.test(b.text)) continue;
+      if (used[j] || b.page !== a.page) continue;
+      if (!/^\d{4}$/.test(b.text)) continue;
       var dy = b.y - a.y;
-      if (dy <= 0 || dy > 2.6) continue;
-      if (Math.abs((b.x + b.w / 2) - ac) > 2) continue;
-      a.text = a.text + (/[A-Za-z]$/.test(a.text) ? '-' : '') + b.text;
+      if (dy < 0.2 || dy > 1.4) continue;
+      var dx1 = Math.abs((b.x + b.w / 2) - (a.x + a.w / 2));
+      var dx2 = Math.abs(b.x - a.x);
+      if (Math.min(dx1, dx2) > 1.5) continue;
+      a.text = a.text + b.text;
       used[j] = true;
       break;
     }
   }
-  var out = [];
-  for (var k = 0; k < items.length; k++) {
-    if (!used[k]) out.push(items[k]);
-  }
-  return out;
+  return items.filter(function (it, idx) { return !used[idx]; });
 }
 
-function mergeRowItems(list) {
-  list.sort(function(a, b) { return a.x - b.x; });
+function mergeClose(list) {
   var out = [];
-  for (var i = 0; i < list.length; i++) {
-    var it = list[i];
-    var last = out[out.length - 1];
-    if (last && (it.x - (last.x + last.w)) < 0.45 && it.x >= last.x &&
-        !isAmountText(last.text) && !isAmountText(it.text) &&
-        !isDate(last.text) && !isDate(it.text)) {
-      last.text = last.text + ' ' + it.text;
-      last.w = (it.x + it.w) - last.x;
-    } else {
-      out.push({ page: it.page, x: it.x, y: it.y, w: it.w, text: it.text });
+  list.forEach(function (it) {
+    var prev = out[out.length - 1];
+    if (prev) {
+      var gap = it.x - (prev.x + prev.w);
+      var special = MONEY_RE.test(prev.text) || MONEY_RE.test(it.text) || DATE_RE.test(prev.text) || DATE_RE.test(it.text);
+      if (!special && gap < 0.25) {
+        prev.text += (gap < 0.05 ? '' : ' ') + it.text;
+        prev.w = (it.x + it.w) - prev.x;
+        return;
+      }
     }
-  }
+    out.push({ page: it.page, x: it.x, y: it.y, w: it.w, text: it.text });
+  });
   return out;
 }
 
 function buildRows(items) {
-  var sorted = items.slice().sort(function(a, b) {
-    if (a.page !== b.page) return a.page - b.page;
-    return a.y - b.y;
+  var pages = {};
+  items.forEach(function (it) {
+    if (!pages[it.page]) pages[it.page] = [];
+    pages[it.page].push(it);
   });
   var rows = [];
-  var cur = null;
-  for (var i = 0; i < sorted.length; i++) {
-    var it = sorted[i];
-    if (!cur || cur.page !== it.page || Math.abs(it.y - cur.y) > 0.4) {
-      cur = { page: it.page, y: it.y, raw: [] };
-      rows.push(cur);
-    }
-    cur.raw.push(it);
-  }
-  for (var r = 0; r < rows.length; r++) {
-    rows[r].items = mergeRowItems(rows[r].raw);
-    var parts = [];
-    for (var c = 0; c < rows[r].items.length; c++) parts.push(rows[r].items[c].text);
-    rows[r].text = parts.join(' | ');
-  }
+  Object.keys(pages).map(Number).sort(function (a, b) { return a - b; }).forEach(function (p) {
+    var list = pages[p].slice().sort(function (a, b) { return (a.y - b.y) || (a.x - b.x); });
+    var cur = null;
+    list.forEach(function (it) {
+      if (!cur || Math.abs(it.y - cur.y) > 0.4) {
+        cur = { page: p, y: it.y, items: [] };
+        rows.push(cur);
+      }
+      cur.items.push(it);
+    });
+  });
+  rows.forEach(function (r) {
+    r.items.sort(function (a, b) { return a.x - b.x; });
+    r.items = mergeClose(r.items);
+    r.text = r.items.map(function (i) { return i.text; }).join(' ');
+  });
   return rows;
 }
 
-// ================= Header dhundho =================
-function findHeader(rows) {
-  for (var pass = 0; pass < 2; pass++) {
-    for (var i = 0; i < rows.length; i++) {
-      var txt = '';
-      var hasTxData = false;
-      for (var j = i; j < rows.length && rows[j].page === rows[i].page && rows[j].y - rows[i].y <= 2.4; j++) {
-        txt += rows[j].text.toUpperCase() + ' ';
-      }
-      var hasBal = /BALANCE/.test(txt);
-      var hasMoney = /DEBIT|WITHDRAW|CREDIT|DEPOSIT|AMOUNT/.test(txt);
-      var hasLabel = /DATE|PARTICULARS|NARRATION|DESCRIPTION/.test(txt);
-      if (hasBal && hasMoney && (pass === 1 || hasLabel)) {
-        var start = i;
-        while (start > 0 && rows[start - 1].page === rows[i].page && rows[i].y - rows[start - 1].y <= 1.6) start--;
-        var end = i;
-        while (end + 1 < rows.length && rows[end + 1].page === rows[i].page && rows[end + 1].y - rows[i].y <= 2.4) end++;
-        return { start: start, end: end };
-      }
-    }
-  }
-  return null;
-}
-
-function getAnchors(rows, hdr) {
-  var a = { debit: null, credit: null, balance: null, amount: null, narr: null, chq: null };
-  for (var r = hdr.start; r <= hdr.end; r++) {
-    for (var i = 0; i < rows[r].items.length; i++) {
-      var it = rows[r].items[i];
-      var up = it.text.toUpperCase();
-      var c = it.x + it.w / 2;
-      if (/WITHDRAW|DEBIT/.test(up)) { if (a.debit === null) a.debit = c; }
-      else if (/DEPOSIT|CREDIT/.test(up)) { if (a.credit === null) a.credit = c; }
-      else if (/BALANCE/.test(up)) { if (a.balance === null) a.balance = c; }
-      else if (/^AMOUNT/.test(up)) { if (a.amount === null) a.amount = c; }
-      else if (/DESCRIPTION|NARRATION|PARTICULARS|DETAILS|REMARKS/.test(up)) { if (a.narr === null) a.narr = c; }
-      else if (/CHEQUE|CHQ/.test(up)) { if (a.chq === null) a.chq = c; }
-    }
-  }
-  return a;
-}
-
-function nearestKey(cx, list) {
-  var best = null;
-  var bd = 1e9;
-  for (var i = 0; i < list.length; i++) {
-    var d = Math.abs(cx - list[i].x);
-    if (d < bd) { bd = d; best = list[i].k; }
-  }
-  return best;
-}
-
-// ================= Transactions banao =================
-var STOP_RE = /^(opening balance|closing balance|total|grand total|page\s*\d|statement (summary|generated)|this is a computer|end of statement|\*{3,}|registered office|legends|disclaimer)/i;
-
-function joinNarr(parts) {
-  var anySpace = false;
-  for (var i = 0; i < parts.length; i++) {
-    if (parts[i].indexOf(' ') !== -1) anySpace = true;
-  }
-  var s = '';
-  for (var j = 0; j < parts.length; j++) {
-    if (j === 0) { s = parts[j]; continue; }
-    if (!anySpace || /[\/\-]$/.test(s)) s += parts[j];
-    else s += ' ' + parts[j];
-  }
-  return s;
-}
-
-function findTxDate(row, leftLimit) {
-  var before = 0;
-  for (var i = 0; i < row.items.length; i++) {
-    var it = row.items[i];
-    if (isDate(it.text)) {
-      if (before <= 3 && (it.x + it.w / 2) < leftLimit) return it;
-      return null;
-    }
-    before++;
-  }
-  return null;
-}
-
-function processRow(tx, row, dateItem, ctx) {
-  for (var i = 0; i < row.items.length; i++) {
-    var it = row.items[i];
-    var t = it.text;
-    var cx = it.x + it.w / 2;
-    if (dateItem && it === dateItem) { tx.date = t; tx.dateX = it.x; continue; }
-    if (isDate(t)) {
-      if (!tx.date) tx.date = t;
-      else if (!tx.valueDate) tx.valueDate = t;
-      continue;
-    }
-    if (isAmountText(t) && cx >= ctx.leftLimit) {
-      var p = parseAmt(t);
-      tx.amounts.push({ num: p.num, suffix: p.suffix, x: cx });
-      continue;
-    }
-    if (/^\(?(dr|cr)\)?\.?$/i.test(t)) continue;
-    if (dateItem && tx.dateX !== null && it.x < tx.dateX - 0.5) {
-      if (/^\d{1,5}$/.test(t)) continue;
-      tx.refParts.push(t);
-      continue;
-    }
-    if (/^\d{6,9}$/.test(t) && ctx.anchors.chq !== null && ctx.anchors.narr !== null &&
-        Math.abs(cx - ctx.anchors.chq) < Math.abs(cx - ctx.anchors.narr)) {
-      tx.chq = t;
-      continue;
-    }
-    tx.narrParts.push(t);
-  }
-}
-
-function finalizeTx(tx, ctx) {
-  if (!tx.amounts.length || !tx.date) return null;
-  var narration = joinNarr(tx.narrParts);
-  if (/^(opening balance|closing balance|b\/f|c\/f|brought forward|carried forward)/i.test(narration)) return null;
-
-  var o = {
-    date: tx.date, valueDate: tx.valueDate, narration: narration,
-    refNo: tx.refParts.join(' '), chqNo: tx.chq,
-    withdrawal: null, deposit: null, balance: null, amt: null, suffix: ''
-  };
+/* row mein date kahan hai (pehle 5 items mein, paise se pehle) */
+function dateIdx(row, dateX) {
   var i;
-  if (ctx.money.length) {
-    for (i = 0; i < tx.amounts.length; i++) {
-      var a = tx.amounts[i];
-      var k = nearestKey(a.x, ctx.money);
-      if (k === 'debit' && o.withdrawal === null) o.withdrawal = a.num;
-      else if (k === 'credit' && o.deposit === null) o.deposit = a.num;
-      else if (k === 'balance' && o.balance === null) o.balance = a.num;
-      else if (k === 'amount' && o.amt === null) { o.amt = a.num; o.suffix = a.suffix; }
-    }
-  } else {
-    var sorted = tx.amounts.slice().sort(function(p, q) { return p.x - q.x; });
-    if (sorted.length === 1) {
-      o.amt = sorted[0].num; o.suffix = sorted[0].suffix;
-    } else {
-      o.balance = sorted[sorted.length - 1].num;
-      for (i = 0; i < sorted.length - 1; i++) {
-        if (sorted[i].num !== 0) { o.amt = sorted[i].num; o.suffix = sorted[i].suffix; break; }
-      }
+  for (i = 0; i < row.items.length && i < 5; i++) {
+    var it = row.items[i];
+    if (MONEY_RE.test(it.text)) return -1;
+    if (DATE_RE.test(it.text)) {
+      if (dateX === null || Math.abs(it.x - dateX) <= 1.0) return i;
     }
   }
-  if (o.withdrawal === 0 && o.deposit !== null && o.deposit !== 0) o.withdrawal = null;
-  if (o.deposit === 0 && o.withdrawal !== null && o.withdrawal !== 0) o.deposit = null;
-  if (o.amt !== null) {
-    if (o.suffix === 'dr') { o.withdrawal = o.amt; o.amt = null; }
-    else if (o.suffix === 'cr') { o.deposit = o.amt; o.amt = null; }
-  }
-  return o;
+  return -1;
 }
 
-function moneyOf(o) {
-  if (o.withdrawal !== null) return o.withdrawal;
-  if (o.deposit !== null) return o.deposit;
-  return o.amt;
+function pickDateX(c) {
+  if (!c.length) return null;
+  var counts = [];
+  var best = 0;
+  var i, j;
+  for (i = 0; i < c.length; i++) {
+    var n = 0;
+    for (j = 0; j < c.length; j++) { if (Math.abs(c[j] - c[i]) <= 1.0) n++; }
+    counts.push(n);
+    if (n > best) best = n;
+  }
+  var m = null;
+  for (i = 0; i < c.length; i++) {
+    if (counts[i] >= best * 0.5 && (m === null || c[i] < m)) m = c[i];
+  }
+  return m;
 }
 
-function resolveSides(list) {
-  function score(dir) {
-    var c = 0;
-    for (var i = 0; i < list.length; i++) {
-      var p = i - dir;
-      if (p < 0 || p >= list.length) continue;
-      if (list[i].balance === null || list[p].balance === null) continue;
-      var m = moneyOf(list[i]);
-      if (m === null) continue;
-      if (Math.abs(Math.abs(list[i].balance - list[p].balance) - m) < 0.02) c++;
-    }
-    return c;
-  }
-  var dir = score(-1) > score(1) ? -1 : 1;
-  for (var i = 0; i < list.length; i++) {
-    var o = list[i];
-    var m = moneyOf(o);
-    var fixed = false;
-    var p = i - dir;
-    if (m !== null && p >= 0 && p < list.length && o.balance !== null && list[p].balance !== null &&
-        !(o.withdrawal !== null && o.deposit !== null)) {
-      var d = round2(o.balance - list[p].balance);
-      if (Math.abs(Math.abs(d) - m) < 0.02) {
-        if (d > 0) { o.deposit = m; o.withdrawal = null; }
-        else { o.withdrawal = m; o.deposit = null; }
-        o.amt = null;
-        fixed = true;
-      }
-    }
-    if (!fixed && o.amt !== null) {
-      if (/\bCR\b|CREDIT|SALARY|DEPOSIT|INTEREST|REFUND|REVERS/i.test(o.narration)) o.deposit = o.amt;
-      else o.withdrawal = o.amt;
-      o.amt = null;
-    }
-  }
-  return list;
+function isHeaderRow(text) {
+  if (/\d[\d,]*\.\d{2}/.test(text)) return false;
+  var found = {};
+  var m = text.match(HDR_RE) || [];
+  m.forEach(function (w) { found[w.toLowerCase().replace(/\s+/g, '')] = 1; });
+  return Object.keys(found).length >= 3;
 }
 
-function categoryOf(n) {
-  var u = n.toUpperCase();
+function joinParts(parts) {
+  var s = '';
+  parts.forEach(function (p) {
+    if (!s) { s = p; return; }
+    if (/[-\/]$/.test(s) || /^[-\/]/.test(p)) s += p; else s += ' ' + p;
+  });
+  return s.replace(/\s+/g, ' ').trim();
+}
+
+function pickRef(left) {
+  var words = left.join(' ').split(/\s+/);
+  var i;
+  for (i = 0; i < words.length; i++) {
+    if (words[i].length >= 5 && /\d/.test(words[i])) return words[i];
+  }
+  return '';
+}
+
+function categoryOf(s) {
+  var u = String(s).toUpperCase();
   if (/UPI/.test(u)) return 'UPI';
   if (/IMPS/.test(u)) return 'IMPS';
   if (/NEFT/.test(u)) return 'NEFT';
   if (/RTGS/.test(u)) return 'RTGS';
-  if (/ATM|CASH WDL|CASH DEP/.test(u)) return 'ATM/Cash';
-  if (/CHQ|CHEQUE|CLG|CLEARING/.test(u)) return 'Cheque';
-  if (/POS|CARD|ECOM/.test(u)) return 'Card';
+  if (/ATM|CASH/.test(u)) return 'ATM/Cash';
+  if (/CHQ|CHEQUE|CLG/.test(u)) return 'Cheque';
+  if (/POS|CARD/.test(u)) return 'Card';
   if (/SALARY/.test(u)) return 'Salary';
-  if (/INT\.?PD|INTEREST|INT CR/.test(u)) return 'Interest';
-  if (/CHARGE|CHRG|FEE|GST|SMS/.test(u)) return 'Charges';
+  if (/INTEREST|INT\.?\s?PD/.test(u)) return 'Interest';
+  if (/CHARGES|CHRG|FEE|GST|SMS/.test(u)) return 'Charges';
   return 'Other';
 }
 
-// ================= Bank info =================
+function guessSide(narr) {
+  var u = String(narr).toUpperCase();
+  if (/INF\/|BY CASH|BY TRANSFER|BY CLG/.test(u)) return 'd';
+  if (/(^|[^A-Z])(CR|CREDIT|DEPOSIT|REFUND|REVERSAL|SALARY|INTEREST|CASHBACK|RECEIVED)([^A-Z]|$)/.test(u)) return 'd';
+  return 'w';
+}
+
+/* ---------- Withdrawal / Deposit ka faisla ---------- */
+function resolveSides(recs, dbg) {
+  var asc = 0, desc = 0, i;
+  for (i = 0; i < recs.length; i++) {
+    var t = recs[i];
+    if (t.amt === null || t.bal === null) continue;
+    var p = recs[i - 1], q = recs[i + 1];
+    if (p && p.bal !== null && Math.abs(Math.abs(t.bal - p.bal) - t.amt) < 0.02) asc++;
+    if (q && q.bal !== null && Math.abs(Math.abs(t.bal - q.bal) - t.amt) < 0.02) desc++;
+  }
+  var dir = asc >= desc ? 1 : -1;
+  var how = { delta: 0, suffix: 0, position: 0, keyword: 0 };
+  dbg.order = dir === 1 ? 'purani-se-nayi' : 'nayi-se-purani';
+  dbg.deltaMatches = { asc: asc, desc: desc };
+
+  var side = [];
+  for (i = 0; i < recs.length; i++) {
+    var r = recs[i];
+    side[i] = null;
+    if (r.amt === null) continue;
+    var e = recs[i - dir];
+    if (e && e.bal !== null && r.bal !== null) {
+      var diff = r.bal - e.bal;
+      if (Math.abs(diff - r.amt) < 0.02) { side[i] = 'd'; how.delta++; continue; }
+      if (Math.abs(diff + r.amt) < 0.02) { side[i] = 'w'; how.delta++; continue; }
+    }
+    if (r.hint) { side[i] = r.hint; how.suffix++; }
+  }
+
+  var sw = 0, nw = 0, sd = 0, nd = 0;
+  for (i = 0; i < recs.length; i++) {
+    if (side[i] && recs[i].tok) {
+      var xr = recs[i].tok.x + recs[i].tok.w;
+      if (side[i] === 'w') { sw += xr; nw++; } else { sd += xr; nd++; }
+    }
+  }
+  var avgW = nw ? sw / nw : null;
+  var avgD = nd ? sd / nd : null;
+  dbg.avgWithdrawalX = avgW === null ? null : r2(avgW);
+  dbg.avgDepositX = avgD === null ? null : r2(avgD);
+
+  for (i = 0; i < recs.length; i++) {
+    var rr = recs[i];
+    if (rr.amt === null) continue;
+    if (!side[i]) {
+      if (avgW !== null && avgD !== null && Math.abs(avgW - avgD) > 1 && rr.tok) {
+        var xx = rr.tok.x + rr.tok.w;
+        side[i] = Math.abs(xx - avgW) <= Math.abs(xx - avgD) ? 'w' : 'd';
+        how.position++;
+      } else {
+        side[i] = guessSide(rr.narr);
+        how.keyword++;
+      }
+    }
+    if (side[i] === 'd') { rr.d = rr.amt; rr.w = 0; } else { rr.w = rr.amt; rr.d = 0; }
+  }
+  dbg.sideBy = how;
+}
+
+/* ---------- Account info ---------- */
 var IFSC_BANK = {
   ICIC: 'ICICI Bank', HDFC: 'HDFC Bank', INDB: 'IndusInd Bank', MAHB: 'Bank of Maharashtra',
   SBIN: 'State Bank of India', UTIB: 'Axis Bank', KKBK: 'Kotak Mahindra Bank', YESB: 'YES Bank',
   PUNB: 'Punjab National Bank', UBIN: 'Union Bank of India', CNRB: 'Canara Bank', BARB: 'Bank of Baroda'
 };
-var BANK_WORDS = [
-  ['ICICI', 'ICICI Bank'], ['HDFC BANK', 'HDFC Bank'], ['INDUSIND', 'IndusInd Bank'],
-  ['BANK OF MAHARASHTRA', 'Bank of Maharashtra'], ['STATE BANK OF INDIA', 'State Bank of India'],
-  ['AXIS BANK', 'Axis Bank'], ['KOTAK', 'Kotak Mahindra Bank'], ['YES BANK', 'YES Bank'],
-  ['PUNJAB NATIONAL', 'Punjab National Bank'], ['UNION BANK', 'Union Bank of India'],
-  ['CANARA', 'Canara Bank'], ['BANK OF BARODA', 'Bank of Baroda']
-];
 
-function extractInfo(rows, headerStart) {
-  var lim = headerStart > 0 ? headerStart : Math.min(rows.length, 40);
-  var parts = [];
-  for (var i = 0; i < lim && i < rows.length; i++) parts.push(rows[i].text);
-  var text = parts.join('\n');
-  var info = { bank: '', accountNo: '', period: '', ifsc: '', micr: '' };
+function extractInfo(rows, firstStart, txs) {
+  var headRows = firstStart > 0 ? rows.slice(0, firstStart) : rows.slice(0, 60);
+  var head = headRows.map(function (r) { return r.text; }).join('\n');
+  var info = { bank: 'Unknown', accountNo: '', period: '', ifsc: '', micr: '' };
 
-  var m = text.match(/\b([A-Z]{4})0[A-Z0-9]{6}\b/);
+  var m = head.match(/\b([A-Z]{4}0[A-Z0-9]{6})\b/);
   if (m) {
-    info.ifsc = m[0];
-    if (IFSC_BANK[m[1]]) info.bank = IFSC_BANK[m[1]];
+    info.ifsc = m[1];
+    if (IFSC_BANK[m[1].substring(0, 4)]) info.bank = IFSC_BANK[m[1].substring(0, 4)];
   }
-  if (!info.bank) {
-    var up = text.toUpperCase();
-    for (var b = 0; b < BANK_WORDS.length; b++) {
-      if (up.indexOf(BANK_WORDS[b][0]) !== -1) { info.bank = BANK_WORDS[b][1]; break; }
+  if (info.bank === 'Unknown') {
+    var names = [
+      [/bank of maharashtra/i, 'Bank of Maharashtra'], [/indusind/i, 'IndusInd Bank'], [/icici/i, 'ICICI Bank'],
+      [/hdfc/i, 'HDFC Bank'], [/state bank/i, 'State Bank of India'], [/axis bank/i, 'Axis Bank'],
+      [/kotak/i, 'Kotak Mahindra Bank'], [/yes bank/i, 'YES Bank'], [/punjab national/i, 'Punjab National Bank'],
+      [/union bank/i, 'Union Bank of India'], [/canara/i, 'Canara Bank'], [/bank of baroda/i, 'Bank of Baroda']
+    ];
+    var i;
+    for (i = 0; i < names.length; i++) {
+      if (names[i][0].test(head)) { info.bank = names[i][1]; break; }
     }
   }
-  var a = text.match(/(?:A\/C|ACCOUNT)[^0-9X*\n]{0,25}([X*]*\d[X*\d]{5,19})/i);
-  if (a) info.accountNo = a[1];
-  var mi = text.match(/MICR[^0-9\n]{0,15}(\d{9})/i);
-  if (mi) info.micr = mi[1];
-  var p = text.match(/(\d{1,2}[\/\-\s][A-Za-z0-9]{2,3}[\/\-\s']*\d{2,4})\s*(?:to|-|TO)\s*(\d{1,2}[\/\-\s][A-Za-z0-9]{2,3}[\/\-\s']*\d{2,4})/);
-  if (p) info.period = p[1] + ' to ' + p[2];
+  m = head.match(/(?:a\/c|account)\s*(?:number|no\.?|#)?\s*[:\-]?\s*(\d{9,18})/i);
+  if (m) info.accountNo = m[1];
+  else {
+    m = head.match(/([xX*]{3,}\d{3,6})/);
+    if (m) info.accountNo = m[1];
+    else { m = head.match(/\b(\d{11,16})\b/); if (m) info.accountNo = m[1]; }
+  }
+  m = head.match(/MICR\s*(?:code|no\.?)?\s*[:\-]?\s*(\d{9})/i);
+  if (m) info.micr = m[1];
+
+  var D = "\\d{1,2}[-\\/. ]+[A-Za-z0-9]{2,9}[-\\/. ,]*'?\\d{2,4}";
+  var pr = new RegExp('(' + D + ')\\s*(?:to|-|–|—|till|through)\\s*(' + D + ')', 'i');
+  m = head.match(pr);
+  if (m) info.period = m[1] + ' to ' + m[2];
+  else if (txs.length) info.period = txs[0].date + ' to ' + txs[txs.length - 1].date;
   return info;
 }
 
-// ================= Poora parse =================
-function parseStatement(allItems) {
-  var items = stackDates(allItems);
+/* ---------- Main analyze ---------- */
+function analyze(rawItems) {
+  var items = stackDates(rawItems);
   var rows = buildRows(items);
-  var docMaxX = 0;
-  for (var i = 0; i < items.length; i++) {
-    if (items[i].x + items[i].w > docMaxX) docMaxX = items[i].x + items[i].w;
-  }
+  var dbg = { totalItems: items.length, totalRows: rows.length };
 
-  var hdr = findHeader(rows);
-  var anchors = { debit: null, credit: null, balance: null, amount: null, narr: null, chq: null };
-  var startRow = 0;
-  if (hdr) {
-    anchors = getAnchors(rows, hdr);
-    startRow = hdr.end + 1;
-  }
+  var cands = [];
+  rows.forEach(function (r) {
+    var di = dateIdx(r, null);
+    if (di >= 0) cands.push(r.items[di].x);
+  });
+  var dateX = pickDateX(cands);
+  dbg.dateX = dateX === null ? null : r2(dateX);
 
-  var money = [];
-  var keys = ['debit', 'credit', 'balance', 'amount'];
-  for (var k = 0; k < keys.length; k++) {
-    if (anchors[keys[k]] !== null) money.push({ k: keys[k], x: anchors[keys[k]] });
+  var firstStart = -1;
+  var lefts = [];
+  if (dateX !== null) {
+    rows.forEach(function (r, idx) {
+      if (dateIdx(r, dateX) < 0) return;
+      if (firstStart < 0) firstStart = idx;
+      var mx = null;
+      r.items.forEach(function (it) {
+        if (MONEY_RE.test(it.text) && (mx === null || it.x < mx)) mx = it.x;
+      });
+      if (mx !== null) lefts.push(mx);
+    });
   }
-  var leftLimit = docMaxX * 0.5;
-  if (money.length) {
-    var xs = [];
-    for (var q = 0; q < money.length; q++) xs.push(money[q].x);
-    xs.sort(function(a, b) { return a - b; });
-    var gap = 6;
-    if (xs.length > 1) {
-      gap = 1e9;
-      for (var g = 1; g < xs.length; g++) {
-        if (xs[g] - xs[g - 1] < gap) gap = xs[g] - xs[g - 1];
-      }
-    }
-    leftLimit = xs[0] - Math.max(gap, 2) * 0.9;
+  var moneyMinX = null;
+  if (lefts.length) {
+    lefts.sort(function (a, b) { return a - b; });
+    moneyMinX = lefts[Math.floor(lefts.length * 0.05)] - 0.5;
   }
-  var ctx = { anchors: anchors, money: money, leftLimit: leftLimit };
-
-  var rawTx = [];
-  var cur = null;
-  var curPage = 0;
-  function newTx() {
-    return { date: '', valueDate: '', dateX: null, narrParts: [], refParts: [], chq: '', amounts: [], lastY: 0 };
-  }
-  for (var r = startRow; r < rows.length; r++) {
-    var row = rows[r];
-    if (row.page !== curPage) {
-      if (cur) rawTx.push(cur);
-      cur = null;
-      curPage = row.page;
-    }
-    var dItem = findTxDate(row, leftLimit);
-    if (dItem) {
-      if (cur) rawTx.push(cur);
-      cur = newTx();
-      processRow(cur, row, dItem, ctx);
-      cur.lastY = row.y;
-      continue;
-    }
-    if (!cur) continue;
-    if (STOP_RE.test(row.text) || (row.y - cur.lastY) > 3.5) {
-      rawTx.push(cur);
-      cur = null;
-      continue;
-    }
-    processRow(cur, row, null, ctx);
-    cur.lastY = row.y;
-  }
-  if (cur) rawTx.push(cur);
-
-  var list = [];
-  for (var t = 0; t < rawTx.length; t++) {
-    var f = finalizeTx(rawTx[t], ctx);
-    if (f) list.push(f);
-  }
-  resolveSides(list);
-  for (var u = 0; u < list.length; u++) {
-    list[u].category = categoryOf(list[u].narration);
-    delete list[u].amt;
-    delete list[u].suffix;
-  }
+  dbg.moneyMinX = moneyMinX === null ? null : r2(moneyMinX);
 
   var sample = [];
-  for (var s = 0; s < rows.length && s < 60; s++) {
-    sample.push('p' + rows[s].page + ' y' + round2(rows[s].y) + ': ' + rows[s].text);
+  var fr = [];
+  rows.slice(0, 60).forEach(function (r) { fr.push('p' + r.page + ' y' + r2(r.y) + ': ' + r.text); });
+  dbg.firstRows = fr;
+
+  if (dateX === null || moneyMinX === null) {
+    dbg.problem = 'Date column ya amount column nahi mila';
+    return { info: extractInfo(rows, firstStart, []), txs: [], debug: dbg };
   }
-  return {
-    info: extractInfo(rows, hdr ? hdr.start : 0),
-    transactions: list,
-    debug: {
-      totalItems: items.length,
-      totalRows: rows.length,
-      headerFound: !!hdr,
-      anchors: anchors,
-      leftLimit: round2(leftLimit),
-      firstRows: sample
+
+  var raw = [];
+  var cur = null;
+  var lastRow = null;
+  var startCount = 0;
+
+  function addItem(tx, it) {
+    if (it.x >= moneyMinX) {
+      if (MONEY_RE.test(it.text)) tx.money.push(it);
+      else if (!/^(dr|cr)\.?$/i.test(it.text)) tx.extras.push(it.text);
+    } else {
+      tx.parts.push(it.text);
     }
-  };
+  }
+
+  rows.forEach(function (row) {
+    var di = dateIdx(row, dateX);
+    if (di >= 0) {
+      startCount++;
+      cur = { date: row.items[di].text, valueDate: '', chq: '', left: [], parts: [], extras: [], money: [] };
+      raw.push(cur);
+      lastRow = row;
+      var k;
+      for (k = 0; k < di; k++) cur.left.push(row.items[k].text);
+      var rest = row.items.slice(di + 1);
+      var p = 0;
+      if (rest[p] && DATE_RE.test(rest[p].text) && rest[p].x < moneyMinX) { cur.valueDate = rest[p].text; p++; }
+      if (rest[p] && /^\d{6,12}$/.test(rest[p].text) && rest[p].x < moneyMinX) { cur.chq = rest[p].text; p++; }
+      for (k = p; k < rest.length; k++) addItem(cur, rest[k]);
+      if (sample.length < 4) {
+        sample.push(row.items.map(function (it) {
+          return it.text + '@' + r2(it.x) + (it.w ? '+' + r2(it.w) : '');
+        }).join(' | '));
+      }
+      return;
+    }
+    if (!cur) return;
+    if (row.page !== lastRow.page || (row.y - lastRow.y) > 4 || STOP_RE.test(row.text) || isHeaderRow(row.text)) {
+      cur = null;
+      return;
+    }
+    row.items.forEach(function (it) {
+      if (it.x < dateX - 0.5) cur.left.push(it.text);
+      else addItem(cur, it);
+    });
+    lastRow = row;
+  });
+  dbg.startRows = startCount;
+  dbg.sampleStartRows = sample;
+
+  var recs = [];
+  raw.forEach(function (t) {
+    var n = t.money.length;
+    if (!n) return;
+    var rec = {
+      date: t.date, valueDate: t.valueDate, chq: t.chq, ref: pickRef(t.left),
+      narr: joinParts(t.parts.concat(t.extras)),
+      amt: null, bal: null, w: null, d: null, tok: null, hint: null
+    };
+    var m = t.money;
+    if (n >= 3) {
+      rec.w = Math.abs(num(m[n - 3].text));
+      rec.d = Math.abs(num(m[n - 2].text));
+      rec.bal = balOf(m[n - 1].text);
+    } else if (n === 2) {
+      rec.amt = Math.abs(num(m[0].text));
+      rec.tok = m[0];
+      rec.bal = balOf(m[1].text);
+    } else {
+      rec.amt = Math.abs(num(m[0].text));
+      rec.tok = m[0];
+    }
+    if (rec.tok) {
+      if (/cr\.?$/i.test(rec.tok.text)) rec.hint = 'd';
+      else if (/dr\.?$/i.test(rec.tok.text)) rec.hint = 'w';
+    }
+    recs.push(rec);
+  });
+
+  resolveSides(recs, dbg);
+
+  var txs = recs.map(function (r) {
+    return {
+      date: r.date,
+      narration: r.narr,
+      category: categoryOf(r.narr),
+      ref: r.ref,
+      chq: r.chq,
+      valueDate: r.valueDate,
+      withdrawal: r.w ? r2(r.w) : null,
+      deposit: r.d ? r2(r.d) : null,
+      balance: r.bal === null ? null : r2(r.bal)
+    };
+  });
+  dbg.txCount = txs.length;
+  return { info: extractInfo(rows, firstStart, txs), txs: txs, debug: dbg };
 }
 
-async function handleFile(req) {
-  if (!req.file) {
-    var e0 = new Error('No file uploaded');
-    e0.status = 400;
-    throw e0;
-  }
-  var password = (req.body && req.body.password) || '';
-  var items;
-  try {
-    items = await readItems(req.file.buffer, password);
-  } catch (e) {
-    var msg = String(e && e.message ? e.message : e);
-    var e1 = new Error(/password/i.test(msg) ? 'PDF password galat hai ya password chahiye' : 'PDF read nahi hui: ' + msg);
-    e1.status = 400;
-    throw e1;
-  }
-  if (!items.length) {
-    var e2 = new Error('PDF me text nahi mila (scanned image PDF support nahi hai)');
-    e2.status = 400;
-    throw e2;
-  }
-  return parseStatement(items);
-}
+/* ---------- Excel ---------- */
+function solid(argb) { return { type: 'pattern', pattern: 'solid', fgColor: { argb: argb } }; }
 
-// ================= Excel =================
-async function buildExcel(info, txs) {
-  var wb = new ExcelJS.Workbook();
-  var ws = wb.addWorksheet('Statement');
+function buildExcel(info, txs) {
   var GREEN = 'FF1B8A5A';
-  var LIGHT = 'FFEAF6F0';
-
-  ws.columns = [
-    { width: 7 }, { width: 13 }, { width: 50 }, { width: 13 }, { width: 18 },
-    { width: 12 }, { width: 13 }, { width: 16 }, { width: 16 }, { width: 16 }
-  ];
+  var wb = new ExcelJS.Workbook();
+  var ws = wb.addWorksheet('Statement', { views: [{ state: 'frozen', ySplit: 8 }] });
+  ws.columns = [{ width: 7 }, { width: 14 }, { width: 60 }, { width: 14 }, { width: 20 }, { width: 12 }, { width: 14 }, { width: 16 }, { width: 16 }, { width: 18 }];
 
   ws.mergeCells('A1:J1');
-  var title = ws.getCell('A1');
-  title.value = 'ACCOUNT STATEMENT';
-  title.font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
-  title.alignment = { horizontal: 'center', vertical: 'middle' };
-  title.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GREEN } };
+  var t = ws.getCell('A1');
+  t.value = 'ACCOUNT STATEMENT';
+  t.font = { bold: true, size: 16, color: { argb: 'FFFFFFFF' } };
+  t.fill = solid(GREEN);
+  t.alignment = { horizontal: 'center', vertical: 'middle' };
   ws.getRow(1).height = 28;
 
-  var infoRows = [
-    ['Bank', info.bank || ''],
-    ['Account', info.accountNo || ''],
-    ['Period', info.period || ''],
-    ['IFSC', info.ifsc || ''],
-    ['MICR', info.micr || '']
-  ];
-  for (var i = 0; i < infoRows.length; i++) {
-    var rn = i + 2;
-    ws.getCell('A' + rn).value = infoRows[i][0];
-    ws.getCell('A' + rn).font = { bold: true };
-    ws.mergeCells('A' + rn + ':B' + rn);
-    ws.getCell('C' + rn).value = infoRows[i][1];
-    ws.mergeCells('C' + rn + ':F' + rn);
-  }
+  var meta = [['Bank', info.bank], ['Account', info.accountNo], ['Period', info.period], ['IFSC', info.ifsc], ['MICR', info.micr]];
+  meta.forEach(function (m, i) {
+    var r = i + 2;
+    ws.mergeCells('A' + r + ':B' + r);
+    ws.mergeCells('C' + r + ':F' + r);
+    ws.getCell('A' + r).value = m[0];
+    ws.getCell('A' + r).font = { bold: true };
+    ws.getCell('C' + r).value = m[1] ? String(m[1]) : '';
+    ws.getCell('C' + r).alignment = { horizontal: 'left' };
+  });
 
-  var headerRowNo = 8;
   var heads = ['S.No', 'Date', 'Narration', 'Category', 'Ref No.', 'Chq No.', 'Value Date', 'Withdrawal (₹)', 'Deposit (₹)', 'Balance (₹)'];
-  var hr = ws.getRow(headerRowNo);
-  for (var h = 0; h < heads.length; h++) {
-    var cell = hr.getCell(h + 1);
-    cell.value = heads[h];
+  var hr = ws.getRow(8);
+  heads.forEach(function (h, c) {
+    var cell = hr.getCell(c + 1);
+    cell.value = h;
     cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
-    cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: GREEN } };
+    cell.fill = solid(GREEN);
     cell.alignment = { horizontal: 'center', vertical: 'middle' };
-  }
+  });
   hr.height = 22;
 
-  for (var k = 0; k < txs.length; k++) {
-    var t = txs[k];
-    var row = ws.getRow(headerRowNo + 1 + k);
-    row.getCell(1).value = k + 1;
-    row.getCell(2).value = t.date;
-    row.getCell(3).value = t.narration;
-    row.getCell(4).value = t.category;
-    row.getCell(5).value = t.refNo;
-    row.getCell(6).value = t.chqNo;
-    row.getCell(7).value = t.valueDate || t.date;
-    row.getCell(8).value = t.withdrawal;
-    row.getCell(9).value = t.deposit;
-    row.getCell(10).value = t.balance;
-    row.getCell(3).alignment = { wrapText: true, vertical: 'top' };
-    for (var c = 8; c <= 10; c++) row.getCell(c).numFmt = '#,##0.00';
-    if (k % 2 === 1) {
-      for (var cc = 1; cc <= 10; cc++) {
-        row.getCell(cc).fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: LIGHT } };
-      }
+  txs.forEach(function (tx, i) {
+    var row = ws.getRow(9 + i);
+    var vals = [i + 1, tx.date, tx.narration, tx.category, tx.ref, tx.chq, tx.valueDate, tx.withdrawal, tx.deposit, tx.balance];
+    var c;
+    for (c = 0; c < 10; c++) {
+      var cell = row.getCell(c + 1);
+      cell.value = vals[c] === null || vals[c] === '' ? null : vals[c];
+      if (i % 2 === 1) cell.fill = solid('FFEAF6F0');
+      cell.alignment = { vertical: 'top', wrapText: c === 2 };
+      if (c >= 7) cell.numFmt = '#,##0.00';
     }
-  }
-  ws.views = [{ state: 'frozen', ySplit: headerRowNo }];
-  return await wb.xlsx.writeBuffer();
+  });
+  return wb.xlsx.writeBuffer();
 }
 
-// ================= Routes =================
-app.get('/', function(req, res) {
-  res.send('BankSync Pro Backend Running! (no-AI parser) - test page: /test');
+/* ---------- Routes ---------- */
+function errMsg(e) {
+  var s = e && e.message ? e.message : String(e);
+  if (/password/i.test(s)) return 'PDF password galat hai ya password chahiye';
+  return s;
+}
+
+function run(req) {
+  if (!req.file) return Promise.reject(new Error('PDF file nahi mili'));
+  return readItems(req.file.buffer, req.body && req.body.password).then(analyze);
+}
+
+app.get('/', function (req, res) { res.send('BankSync Pro backend chal raha hai'); });
+
+app.post('/parse', upload.single('pdf'), function (req, res) {
+  run(req).then(function (r) {
+    res.json({ info: r.info, transactions: r.txs, debug: r.debug });
+  }).catch(function (e) {
+    res.status(400).json({ error: errMsg(e) });
+  });
 });
 
-app.post('/parse', upload.single('pdf'), async function(req, res) {
-  try {
-    var result = await handleFile(req);
-    res.json(result);
-  } catch (e) {
-    res.status(e.status || 500).json({ error: String(e.message || e) });
-  }
-});
-
-app.post('/convert', upload.single('pdf'), async function(req, res) {
-  try {
-    var result = await handleFile(req);
-    if (!result.transactions.length) {
-      return res.status(400).json({ error: 'Transactions nahi mile. /test page pe debug dekho.' });
+app.post('/convert', upload.single('pdf'), function (req, res) {
+  run(req).then(function (r) {
+    if (!r.txs.length) {
+      res.status(422).json({ error: 'No transactions found' });
+      return null;
     }
-    var buf = await buildExcel(result.info, result.transactions);
-    res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
-    res.setHeader('Content-Disposition', 'attachment; filename="statement.xlsx"');
-    res.send(Buffer.from(buf));
-  } catch (e) {
-    console.log('Convert error:', e);
-    res.status(e.status || 500).json({ error: String(e.message || e) });
+    return buildExcel(r.info, r.txs).then(function (buf) {
+      res.set('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      res.set('Content-Disposition', 'attachment; filename="BankSync_Statement.xlsx"');
+      res.send(Buffer.from(buf));
+    });
+  }).catch(function (e) {
+    res.status(400).json({ error: errMsg(e) });
+  });
+});
+
+var TEST_PAGE = `<!DOCTYPE html>
+<html><head><meta charset="utf-8"><title>BankSync Test</title>
+<style>
+body{font-family:Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:20px}
+h2{color:#2ecc8f}
+input,button{padding:10px;margin:4px;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#e6edf3}
+button{background:#1b8a5a;border:0;cursor:pointer;font-weight:bold}
+table{border-collapse:collapse;width:100%;font-size:12px;margin-top:12px}
+th{background:#1b8a5a;color:#fff;padding:6px;position:sticky;top:0}
+td{border-bottom:1px solid #30363d;padding:5px;vertical-align:top}
+tr:nth-child(even) td{background:#161b22}
+.num{text-align:right;white-space:nowrap}
+textarea{width:100%;height:260px;background:#010409;color:#9ef0c4;border:1px solid #30363d;font-size:11px}
+#wrap{max-height:520px;overflow:auto}
+</style></head><body>
+<h2>BankSync Pro - Test Page</h2>
+<div>
+<input type="file" id="f" accept="application/pdf">
+<input type="password" id="pw" placeholder="PDF password (agar ho)">
+<button onclick="parseIt()">PARSE KARO</button>
+<button onclick="dl()">EXCEL DOWNLOAD</button>
+</div>
+<div id="st" style="margin:8px 4px"></div>
+<div id="info" style="margin:4px"></div>
+<div id="wrap"></div>
+<h3>Debug box</h3>
+<textarea id="dbg" readonly></textarea>
+<script>
+function esc(s){return String(s===null||s===undefined?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
+function fmt(v){return v===null||v===undefined?'':Number(v).toLocaleString('en-IN',{minimumFractionDigits:2});}
+function post(path,type,done){
+  var f=document.getElementById('f').files[0];
+  if(!f){alert('Pehle PDF choose karo');return;}
+  var fd=new FormData();
+  fd.append('pdf',f);
+  var pw=document.getElementById('pw').value;
+  if(pw){fd.append('password',pw);}
+  var x=new XMLHttpRequest();
+  x.open('POST',path);
+  x.responseType=type;
+  x.onload=function(){done(x);};
+  x.onerror=function(){document.getElementById('st').textContent='Network error';};
+  x.send(fd);
+}
+function parseIt(){
+  var st=document.getElementById('st');
+  st.textContent='Parse ho raha hai... (pehli baar 30-60 sec lag sakte hain)';
+  post('/parse','json',function(x){
+    var r=x.response;
+    if(!r||x.status!==200){st.textContent='Error: '+(r&&r.error?r.error:x.status);return;}
+    show(r);
+  });
+}
+function show(r){
+  var t=r.transactions;
+  document.getElementById('st').textContent=t.length+' transactions mile';
+  var i=r.info;
+  document.getElementById('info').innerHTML='<b>Bank:</b> '+esc(i.bank)+' &nbsp; <b>Account:</b> '+esc(i.accountNo)+' &nbsp; <b>Period:</b> '+esc(i.period)+' &nbsp; <b>IFSC:</b> '+esc(i.ifsc)+' &nbsp; <b>MICR:</b> '+esc(i.micr);
+  var h='<table><tr><th>#</th><th>Date</th><th>Narration</th><th>Category</th><th>Ref</th><th>Chq</th><th>Value Date</th><th>Withdrawal</th><th>Deposit</th><th>Balance</th></tr>';
+  var k;
+  for(k=0;k<t.length;k++){
+    var a=t[k];
+    h+='<tr><td>'+(k+1)+'</td><td>'+esc(a.date)+'</td><td>'+esc(a.narration)+'</td><td>'+esc(a.category)+'</td><td>'+esc(a.ref)+'</td><td>'+esc(a.chq)+'</td><td>'+esc(a.valueDate)+'</td><td class="num">'+fmt(a.withdrawal)+'</td><td class="num">'+fmt(a.deposit)+'</td><td class="num">'+fmt(a.balance)+'</td></tr>';
   }
-});
+  h+='</table>';
+  document.getElementById('wrap').innerHTML=h;
+  document.getElementById('dbg').value=JSON.stringify({info:r.info,debug:r.debug},null,2);
+}
+function dl(){
+  var st=document.getElementById('st');
+  st.textContent='Excel ban raha hai...';
+  post('/convert','blob',function(x){
+    if(x.status!==200){st.textContent='Excel error: '+x.status;return;}
+    var url=URL.createObjectURL(x.response);
+    var a=document.createElement('a');
+    a.href=url;a.download='BankSync_Statement.xlsx';
+    document.body.appendChild(a);a.click();document.body.removeChild(a);
+    st.textContent='Excel download ho gaya';
+  });
+}
+</script></body></html>`;
 
-var TEST_PAGE = [
-'<!DOCTYPE html><html><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1">',
-'<title>BankSync Test</title>',
-'<style>body{font-family:Segoe UI,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:20px}',
-'.box{max-width:1100px;margin:0 auto}h1{color:#00d084}',
-'input,button{padding:10px;border-radius:8px;border:1px solid #30363d;background:#161b22;color:#e6edf3;margin:4px 0}',
-'button{background:#00a86b;border:0;cursor:pointer;font-weight:700}',
-'table{border-collapse:collapse;width:100%;font-size:12px;margin-top:12px}',
-'th{background:#1b8a5a;padding:6px;text-align:left;position:sticky;top:0}',
-'td{padding:5px 6px;border-bottom:1px solid #30363d}',
-'.w{max-height:420px;overflow:auto;border:1px solid #30363d;border-radius:8px}',
-'pre{background:#161b22;padding:12px;border-radius:8px;overflow:auto;font-size:11px;max-height:300px}',
-'.r{color:#ff6b6b}.g{color:#00d084}</style></head><body><div class="box">',
-'<h1>BankSync - Test Page</h1>',
-'<div><input type="file" id="f" accept=".pdf"><br>',
-'<input type="text" id="p" placeholder="PDF password (agar ho)"><br>',
-'<button onclick="runParse()">PARSE KARO</button> ',
-'<button onclick="runExcel()">EXCEL DOWNLOAD</button></div>',
-'<p id="s"></p><div class="w"><table><thead><tr><th>#</th><th>Date</th><th>Narration</th><th>Ref</th><th>Withdrawal</th><th>Deposit</th><th>Balance</th></tr></thead><tbody id="b"></tbody></table></div>',
-'<h3>Debug (problem aaye to ye copy karke bhejo)</h3><pre id="d"></pre>',
-'<script>',
-'var BASE = "";',
-'function getForm(){var f=document.getElementById("f").files[0];if(!f){alert("PDF chuno");return null;}',
-'var fd=new FormData();fd.append("pdf",f);var pw=document.getElementById("p").value;if(pw)fd.append("password",pw);return fd;}',
-'function cell(tr,txt,cls){var td=document.createElement("td");td.textContent=(txt===null||txt===undefined)?"":txt;if(cls)td.className=cls;tr.appendChild(td);}',
-'function runParse(){var fd=getForm();if(!fd)return;var s=document.getElementById("s");s.textContent="Processing... (pehli baar 30-60 sec lag sakte hain)";',
-'fetch(BASE+"/parse",{method:"POST",body:fd}).then(function(r){return r.json();}).then(function(j){',
-'if(j.error){s.textContent="Error: "+j.error;return;}',
-'var tb=document.getElementById("b");tb.innerHTML="";var t=j.transactions;',
-'for(var i=0;i<t.length;i++){var tr=document.createElement("tr");cell(tr,i+1);cell(tr,t[i].date);cell(tr,t[i].narration);cell(tr,t[i].refNo);cell(tr,t[i].withdrawal,"r");cell(tr,t[i].deposit,"g");cell(tr,t[i].balance);tb.appendChild(tr);}',
-'s.textContent="Bank: "+(j.info.bank||"?")+" | Transactions: "+t.length+" | Header mila: "+j.debug.headerFound;',
-'document.getElementById("d").textContent=JSON.stringify({info:j.info,debug:j.debug},null,2);',
-'}).catch(function(e){s.textContent="Server error: "+e;});}',
-'function runExcel(){var fd=getForm();if(!fd)return;var s=document.getElementById("s");s.textContent="Excel ban raha hai...";',
-'fetch(BASE+"/convert",{method:"POST",body:fd}).then(function(r){if(!r.ok){return r.json().then(function(j){throw new Error(j.error);});}return r.blob();}).then(function(bl){',
-'var a=document.createElement("a");a.href=URL.createObjectURL(bl);a.download="statement.xlsx";a.click();s.textContent="Excel download ho gaya";',
-'}).catch(function(e){s.textContent="Error: "+e.message;});}',
-'</script></div></body></html>'
-].join('\n');
-
-app.get('/test', function(req, res) {
-  res.setHeader('Content-Type', 'text/html; charset=utf-8');
-  res.send(TEST_PAGE);
-});
+app.get('/test', function (req, res) { res.send(TEST_PAGE); });
 
 var PORT = process.env.PORT || 3000;
-app.listen(PORT, function() {
-  console.log('BankSync Pro running on port ' + PORT);
-});
+app.listen(PORT, function () { console.log('BankSync Pro running on port ' + PORT); });
