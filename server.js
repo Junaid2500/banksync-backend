@@ -11,7 +11,7 @@ var upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 
 var MONEY_RE = /^\(?-?₹?\s?\d[\d,]*\.\d{2}\)?\s?(?:dr|cr)?\.?$/i;
 var DATE_RE = /^(?:\d{1,2}[-\/. ](?:\d{1,2}|[A-Za-z]{3,9})[-\/. ,']*\d{2,4}|\d{4}-\d{2}-\d{2})$/;
 var STACK_RE = /^\d{1,2}[-\/ ][A-Za-z]{3,9}[-\/ ]?$/;
-var STOP_RE = /(generated on|page\s+\d+\s+of|closing balance|opening balance|statement summary|total\s+(debit|credit|withdrawal|deposit)|grand total|end of statement|computer generated|registered office|legends?\s*:)/i;
+var STOP_RE = /(generated on|page\s+\d+\s+of|closing balance|opening balance|statement summary|total\s+(debit|credit|withdrawal|deposit)|grand total|end of statement|computer generated|system generated|registered office|regd\.?\s*office|corporate identity number|cin\s*[:\-]|toll[- ]?free|customer care|grievance|disclaimer|e\.?\s?&\.?\s?o\.?\s?e\.?|terms and condition|subject to realisation|this is a (system|computer)|swift\s*code|www\.[a-z]|https?:\/\/|member.*deposit insurance|all disputes|jurisdiction|for any quer(y|ies)|legends?\s*:)/i;
 var HDR_RE = /\b(s\.?\s?no|sl\.?\s?no|transaction|txn|date|cheque|chq|description|narration|particulars|details|withdrawals?|deposits?|debit|credit|balance|available|amount|ref|dr|cr)\b/gi;
 var OPEN_RE = /^(brought\s*forward|balance\s*brought\s*forward|opening\s*balance|op\.?\s*bal\.?|b\/f\b|carried\s*forward|balance\s*carried\s*forward|c\/f\b)/i;
 
@@ -122,6 +122,21 @@ function buildRows(items) {
     r.text = r.items.map(function (i) { return i.text; }).join(' ');
   });
   return rows;
+}
+
+/* row-to-row normal line height nikalta hai, isi se footer-gap decide hota hai */
+function computePitch(rows) {
+  var gaps = [];
+  var i;
+  for (i = 1; i < rows.length; i++) {
+    if (rows[i].page === rows[i - 1].page) {
+      var g = rows[i].y - rows[i - 1].y;
+      if (g > 0.05 && g < 3) gaps.push(g);
+    }
+  }
+  if (!gaps.length) return 0.75;
+  gaps.sort(function (a, b) { return a - b; });
+  return gaps[Math.floor(gaps.length / 2)];
 }
 
 /* row mein date kahan hai (pehle 5 items mein, paise se pehle) */
@@ -315,6 +330,11 @@ function analyze(rawItems) {
   var rows = buildRows(items);
   var dbg = { totalItems: items.length, totalRows: rows.length };
 
+  var pitch = computePitch(rows);
+  var maxGap = Math.min(Math.max(pitch * 3.5, 1.5), 5);
+  dbg.linePitch = r2(pitch);
+  dbg.maxRowGap = r2(maxGap);
+
   var cands = [];
   rows.forEach(function (r) {
     var di = dateIdx(r, null);
@@ -389,7 +409,7 @@ function analyze(rawItems) {
       return;
     }
     if (!cur) return;
-    if (row.page !== lastRow.page || (row.y - lastRow.y) > 4 || STOP_RE.test(row.text) || isHeaderRow(row.text)) {
+    if (row.page !== lastRow.page || (row.y - lastRow.y) > maxGap || STOP_RE.test(row.text) || isHeaderRow(row.text)) {
       cur = null;
       return;
     }
@@ -521,6 +541,9 @@ function errMsg(e) {
     try { s = JSON.stringify(e); } catch (x) { s = ''; }
   }
   if (/password/i.test(s)) return 'PDF password galat hai ya password chahiye';
+  if (/compression|flate stream|bad xref|invalid pdf structure|unexpected end of file/i.test(s)) {
+    return 'Ye PDF file ka format non-standard/corrupt hai (shayad kisi unlock-tool se banayi gayi). PDF ko Chrome mein kholkar Print > Save as PDF karke naya file banao, phir usi ko upload karo.';
+  }
   if (!s || s === '{}' || s === '[object Object]') {
     return 'PDF padhi nahi ja saki (password-protected, scan ki hui image ya damaged ho sakti hai)';
   }
