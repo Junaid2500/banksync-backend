@@ -13,6 +13,7 @@ var DATE_RE = /^(?:\d{1,2}[-\/. ](?:\d{1,2}|[A-Za-z]{3,9})[-\/. ,']*\d{2,4}|\d{4
 var STACK_RE = /^\d{1,2}[-\/ ][A-Za-z]{3,9}[-\/ ]?$/;
 var STOP_RE = /(generated on|page\s+\d+\s+of|closing balance|opening balance|statement summary|total\s+(debit|credit|withdrawal|deposit)|grand total|end of statement|computer generated|registered office|legends?\s*:)/i;
 var HDR_RE = /\b(s\.?\s?no|sl\.?\s?no|transaction|txn|date|cheque|chq|description|narration|particulars|details|withdrawals?|deposits?|debit|credit|balance|available|amount|ref|dr|cr)\b/gi;
+var OPEN_RE = /^(brought\s*forward|balance\s*brought\s*forward|opening\s*balance|op\.?\s*bal\.?|b\/f\b|carried\s*forward|balance\s*carried\s*forward|c\/f\b)/i;
 
 function r2(x) { return Math.round(x * 100) / 100; }
 
@@ -402,12 +403,15 @@ function analyze(rawItems) {
   dbg.sampleStartRows = sample;
 
   var recs = [];
+  var skippedOpening = 0;
   raw.forEach(function (t) {
     var n = t.money.length;
     if (!n) return;
+    var narrText = joinParts(t.parts.concat(t.extras));
+    if (OPEN_RE.test(narrText.trim())) { skippedOpening++; return; }
     var rec = {
       date: t.date, valueDate: t.valueDate, chq: t.chq, ref: pickRef(t.left),
-      narr: joinParts(t.parts.concat(t.extras)),
+      narr: narrText,
       amt: null, bal: null, w: null, d: null, tok: null, hint: null
     };
     var m = t.money;
@@ -429,6 +433,7 @@ function analyze(rawItems) {
     }
     recs.push(rec);
   });
+  dbg.skippedOpeningRows = skippedOpening;
 
   resolveSides(recs, dbg);
 
