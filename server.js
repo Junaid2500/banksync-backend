@@ -36,16 +36,22 @@ function readItems(buffer, password) {
   return new Promise(function (resolve, reject) {
     var items = [];
     var page = 0;
+    var finished = false;
     var opts = password ? { password: password } : {};
-    var reader = new PdfReader(opts);
-    reader.parseBuffer(buffer, function (err, item) {
-      if (err) { reject(err); return; }
-      if (!item) { resolve(items); return; }
-      if (item.page) { page = item.page; return; }
-      if (item.text !== undefined && String(item.text).trim() !== '') {
-        items.push({ page: page, x: item.x, y: item.y, w: item.w || 0, text: String(item.text).trim() });
-      }
-    });
+    try {
+      var reader = new PdfReader(opts);
+      reader.parseBuffer(buffer, function (err, item) {
+        if (finished) return;
+        if (err) { finished = true; reject(err); return; }
+        if (!item) { finished = true; resolve(items); return; }
+        if (item.page) { page = item.page; return; }
+        if (item.text !== undefined && String(item.text).trim() !== '') {
+          items.push({ page: page, x: item.x, y: item.y, w: item.w || 0, text: String(item.text).trim() });
+        }
+      });
+    } catch (e) {
+      if (!finished) { finished = true; reject(e); }
+    }
   });
 }
 
@@ -499,9 +505,21 @@ function buildExcel(info, txs) {
 
 /* ---------- Routes ---------- */
 function errMsg(e) {
-  var s = e && e.message ? e.message : String(e);
+  var s = '';
+  if (e && e.parserError) {
+    s = e.parserError.message ? e.parserError.message : String(e.parserError);
+  } else if (e && e.message) {
+    s = e.message;
+  } else if (typeof e === 'string') {
+    s = e;
+  } else {
+    try { s = JSON.stringify(e); } catch (x) { s = ''; }
+  }
   if (/password/i.test(s)) return 'PDF password galat hai ya password chahiye';
-  return s;
+  if (!s || s === '{}' || s === '[object Object]') {
+    return 'PDF padhi nahi ja saki (password-protected, scan ki hui image ya damaged ho sakti hai)';
+  }
+  return 'PDF error: ' + s;
 }
 
 function run(req) {
@@ -515,6 +533,7 @@ app.post('/parse', upload.single('pdf'), function (req, res) {
   run(req).then(function (r) {
     res.json({ info: r.info, transactions: r.txs, debug: r.debug });
   }).catch(function (e) {
+    console.log('parse error:', e);
     res.status(400).json({ error: errMsg(e) });
   });
 });
@@ -531,6 +550,7 @@ app.post('/convert', upload.single('pdf'), function (req, res) {
       res.send(Buffer.from(buf));
     });
   }).catch(function (e) {
+    console.log('convert error:', e);
     res.status(400).json({ error: errMsg(e) });
   });
 });
