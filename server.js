@@ -13,6 +13,21 @@ var DATE_RE = /^(?:\d{1,2}[-\/. ](?:\d{1,2}|[A-Za-z]{3,9})[-\/. ,']*\d{2,4}|\d{4
 var STACK_RE = /^\d{1,2}[-\/ ][A-Za-z]{3,9}[-\/ ]?$/;     // 01-Apr-
 var STACK_YMD_RE = /^\d{4}-\d{2}-$/;                    // 2026-02-
 var STOP_RE = /(generated on|page\s+\d+\s+of|closing balance|opening balance|statement summary|total\s+(debit|credit|withdrawal|deposit)|grand total|end of statement|computer generated|system generated|registered office|regd\.?\s*office|corporate identity number|cin\s*[:\-]|toll[- ]?free|customer care|grievance|disclaimer|e\.?\s?&\.?\s?o\.?\s?e\.?|terms and condition|subject to realisation|this is a (system|computer)|swift\s*code|www\.[a-z]|https?:\/\/|member.*deposit insurance|all disputes|jurisdiction|for any quer(y|ies)|legends?\s*:)/i;
+function looksLikeFooterRow(text) {
+  var s = String(text || '').toLowerCase().replace(/\s+/g, '');
+  if (!s) return false;
+
+  // HDFC footer (exactly page end pe aata hai)
+  if (s === 'hdfcbanklimited') return true;
+
+  // Common HDFC disclaimer blocks (spaces ke bina bhi aate hain)
+  if (s.indexOf('closingbalanceincludes') >= 0) return true;
+  if (s.indexOf('contentsofthisstatement') >= 0) return true;
+  if (s.indexOf('stateaccountbranchgstn') >= 0) return true;
+  if (s.indexOf('registeredofficeaddress') >= 0) return true;
+
+  return false;
+}
 var HDR_RE = /\b(s\.?\s?no|sl\.?\s?no|transaction|txn|date|cheque|chq|description|narration|particulars|details|withdrawals?|deposits?|debit|credit|balance|available|amount|ref|dr|cr)\b/gi;
 var OPEN_RE = /^(brought\s*forward|balance\s*brought\s*forward|opening\s*balance|op\.?\s*bal\.?|b\/f\b|carried\s*forward|balance\s*carried\s*forward|c\/f\b)/i;
 
@@ -327,7 +342,7 @@ function extractInfo(rows, firstStart, txs) {
   var head = headRows.map(function (r) { return r.text; }).join('\n');
   var info = { bank: 'Unknown', accountNo: '', period: '', ifsc: '', micr: '' };
 
-  var m = head.match(/\b([A-Z]{4}0[A-Z0-9]{6})\b/);
+  var m = head.match(/([A-Z]{4}0[A-Z0-9]{6})/);
   if (m) {
     info.ifsc = m[1];
     if (IFSC_BANK[m[1].substring(0, 4)]) info.bank = IFSC_BANK[m[1].substring(0, 4)];
@@ -456,10 +471,10 @@ function analyze(rawItems) {
 
     if (!cur) return;
 
-    if (row.page !== lastRow.page || (row.y - lastRow.y) > maxGap || STOP_RE.test(row.text) || isHeaderRow(row.text)) {
-      cur = null;
-      return;
-    }
+    if (row.page !== lastRow.page || (row.y - lastRow.y) > maxGap || STOP_RE.test(row.text) || isHeaderRow(row.text) || looksLikeFooterRow(row.text)) {
+  cur = null;
+  return;
+}
 
     row.items.forEach(function (it) {
       if (it.x < dateX - 0.5) cur.left.push(it.text);
