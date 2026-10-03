@@ -10,7 +10,8 @@ var upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 
 
 var MONEY_RE = /^\(?-?₹?\s?\d[\d,]*\.\d{2}\)?\s?(?:dr|cr)?\.?$/i;
 var DATE_RE = /^(?:\d{1,2}[-\/. ](?:\d{1,2}|[A-Za-z]{3,9})[-\/. ,']*\d{2,4}|\d{4}-\d{2}-\d{2})$/;
-var STACK_RE = /^\d{1,2}[-\/ ][A-Za-z]{3,9}[-\/ ]?$/;
+var STACK_RE = /^\d{1,2}[-\/ ][A-Za-z]{3,9}[-\/ ]?$/;     // 01-Apr-
+var STACK_YMD_RE = /^\d{4}-\d{2}-$/;                    // 2026-02-
 var STOP_RE = /(generated on|page\s+\d+\s+of|closing balance|opening balance|statement summary|total\s+(debit|credit|withdrawal|deposit)|grand total|end of statement|computer generated|system generated|registered office|regd\.?\s*office|corporate identity number|cin\s*[:\-]|toll[- ]?free|customer care|grievance|disclaimer|e\.?\s?&\.?\s?o\.?\s?e\.?|terms and condition|subject to realisation|this is a (system|computer)|swift\s*code|www\.[a-z]|https?:\/\/|member.*deposit insurance|all disputes|jurisdiction|for any quer(y|ies)|legends?\s*:)/i;
 var HDR_RE = /\b(s\.?\s?no|sl\.?\s?no|transaction|txn|date|cheque|chq|description|narration|particulars|details|withdrawals?|deposits?|debit|credit|balance|available|amount|ref|dr|cr)\b/gi;
 var OPEN_RE = /^(brought\s*forward|balance\s*brought\s*forward|opening\s*balance|op\.?\s*bal\.?|b\/f\b|carried\s*forward|balance\s*carried\s*forward|c\/f\b)/i;
@@ -56,27 +57,59 @@ function readItems(buffer, password) {
   });
 }
 
-/* "01-May-" + "2026" (neeche wali line) ko jodta hai */
+/* date split join:
+   01-Apr- + 2026
+   2026-02- + 14
+*/
 function stackDates(items) {
   var used = {};
   var i, j;
+
+  function closeX(a, b) {
+    var ac = a.x + a.w / 2;
+    var bc = b.x + b.w / 2;
+    var dx1 = Math.abs(bc - ac);
+    var dx2 = Math.abs(b.x - a.x);
+    return Math.min(dx1, dx2) <= 1.5;
+  }
+
   for (i = 0; i < items.length; i++) {
     var a = items[i];
-    if (!STACK_RE.test(a.text)) continue;
-    for (j = 0; j < items.length; j++) {
-      var b = items[j];
-      if (used[j] || b.page !== a.page) continue;
-      if (!/^\d{4}$/.test(b.text)) continue;
-      var dy = b.y - a.y;
-      if (dy < 0.2 || dy > 1.4) continue;
-      var dx1 = Math.abs((b.x + b.w / 2) - (a.x + a.w / 2));
-      var dx2 = Math.abs(b.x - a.x);
-      if (Math.min(dx1, dx2) > 1.5) continue;
-      a.text = a.text + b.text;
-      used[j] = true;
-      break;
+
+    // Case A: 01-Apr- + 2026
+    if (STACK_RE.test(a.text)) {
+      for (j = 0; j < items.length; j++) {
+        var b1 = items[j];
+        if (used[j] || b1.page !== a.page) continue;
+        if (!/^\d{4}$/.test(b1.text)) continue;
+        var dy1 = b1.y - a.y;
+        if (dy1 < 0.2 || dy1 > 1.6) continue;
+        if (!closeX(a, b1)) continue;
+        a.text = a.text + b1.text;
+        used[j] = true;
+        break;
+      }
+      continue;
+    }
+
+    // Case B: 2026-02- + 14  => 2026-02-14
+    if (STACK_YMD_RE.test(a.text)) {
+      for (j = 0; j < items.length; j++) {
+        var b2 = items[j];
+        if (used[j] || b2.page !== a.page) continue;
+        if (!/^\d{1,2}$/.test(b2.text)) continue;
+        var dy2 = b2.y - a.y;
+        if (dy2 < 0.2 || dy2 > 1.8) continue;
+        if (!closeX(a, b2)) continue;
+
+        var dd = b2.text.length === 1 ? ('0' + b2.text) : b2.text;
+        a.text = a.text + dd;
+        used[j] = true;
+        break;
+      }
     }
   }
+
   return items.filter(function (it, idx) { return !used[idx]; });
 }
 
@@ -86,7 +119,13 @@ function mergeClose(list) {
     var prev = out[out.length - 1];
     if (prev) {
       var gap = it.x - (prev.x + prev.w);
-      var special = MONEY_RE.test(prev.text) || MONEY_RE.test(it.text) || DATE_RE.test(prev.text) || DATE_RE.test(it.text);
+
+      var special =
+        MONEY_RE.test(prev.text) || MONEY_RE.test(it.text) ||
+        DATE_RE.test(prev.text) || DATE_RE.test(it.text) ||
+        STACK_RE.test(prev.text) || STACK_RE.test(it.text) ||
+        STACK_YMD_RE.test(prev.text) || STACK_YMD_RE.test(it.text);
+
       if (!special && gap < 0.25) {
         prev.text += (gap < 0.05 ? '' : ' ') + it.text;
         prev.w = (it.x + it.w) - prev.x;
@@ -104,6 +143,7 @@ function buildRows(items) {
     if (!pages[it.page]) pages[it.page] = [];
     pages[it.page].push(it);
   });
+
   var rows = [];
   Object.keys(pages).map(Number).sort(function (a, b) { return a - b; }).forEach(function (p) {
     var list = pages[p].slice().sort(function (a, b) { return (a.y - b.y) || (a.x - b.x); });
@@ -116,6 +156,7 @@ function buildRows(items) {
       cur.items.push(it);
     });
   });
+
   rows.forEach(function (r) {
     r.items.sort(function (a, b) { return a.x - b.x; });
     r.items = mergeClose(r.items);
@@ -124,7 +165,6 @@ function buildRows(items) {
   return rows;
 }
 
-/* row-to-row normal line height nikalta hai, isi se footer-gap decide hota hai */
 function computePitch(rows) {
   var gaps = [];
   var i;
@@ -218,7 +258,6 @@ function guessSide(narr) {
   return 'w';
 }
 
-/* ---------- Withdrawal / Deposit ka faisla ---------- */
 function resolveSides(recs, dbg) {
   var asc = 0, desc = 0, i;
   for (i = 0; i < recs.length; i++) {
@@ -277,7 +316,6 @@ function resolveSides(recs, dbg) {
   dbg.sideBy = how;
 }
 
-/* ---------- Account info ---------- */
 var IFSC_BANK = {
   ICIC: 'ICICI Bank', HDFC: 'HDFC Bank', INDB: 'IndusInd Bank', MAHB: 'Bank of Maharashtra',
   SBIN: 'State Bank of India', UTIB: 'Axis Bank', KKBK: 'Kotak Mahindra Bank', YESB: 'YES Bank',
@@ -294,6 +332,7 @@ function extractInfo(rows, firstStart, txs) {
     info.ifsc = m[1];
     if (IFSC_BANK[m[1].substring(0, 4)]) info.bank = IFSC_BANK[m[1].substring(0, 4)];
   }
+
   if (info.bank === 'Unknown') {
     var names = [
       [/bank of maharashtra/i, 'Bank of Maharashtra'], [/indusind/i, 'IndusInd Bank'], [/icici/i, 'ICICI Bank'],
@@ -306,6 +345,7 @@ function extractInfo(rows, firstStart, txs) {
       if (names[i][0].test(head)) { info.bank = names[i][1]; break; }
     }
   }
+
   m = head.match(/(?:a\/c|account)\s*(?:number|no\.?|#)?\s*[:\-]?\s*(\d{9,18})/i);
   if (m) info.accountNo = m[1];
   else {
@@ -313,6 +353,7 @@ function extractInfo(rows, firstStart, txs) {
     if (m) info.accountNo = m[1];
     else { m = head.match(/\b(\d{11,16})\b/); if (m) info.accountNo = m[1]; }
   }
+
   m = head.match(/MICR\s*(?:code|no\.?)?\s*[:\-]?\s*(\d{9})/i);
   if (m) info.micr = m[1];
 
@@ -321,17 +362,17 @@ function extractInfo(rows, firstStart, txs) {
   m = head.match(pr);
   if (m) info.period = m[1] + ' to ' + m[2];
   else if (txs.length) info.period = txs[0].date + ' to ' + txs[txs.length - 1].date;
+
   return info;
 }
 
-/* ---------- Main analyze ---------- */
 function analyze(rawItems) {
   var items = stackDates(rawItems);
   var rows = buildRows(items);
   var dbg = { totalItems: items.length, totalRows: rows.length };
 
   var pitch = computePitch(rows);
-  var maxGap = Math.min(Math.max(pitch * 3.5, 1.5), 5);
+  var maxGap = Math.min(Math.max(pitch * 4.5, 1.8), 6);
   dbg.linePitch = r2(pitch);
   dbg.maxRowGap = r2(maxGap);
 
@@ -356,6 +397,7 @@ function analyze(rawItems) {
       if (mx !== null) lefts.push(mx);
     });
   }
+
   var moneyMinX = null;
   if (lefts.length) {
     lefts.sort(function (a, b) { return a - b; });
@@ -363,7 +405,6 @@ function analyze(rawItems) {
   }
   dbg.moneyMinX = moneyMinX === null ? null : r2(moneyMinX);
 
-  var sample = [];
   var fr = [];
   rows.slice(0, 60).forEach(function (r) { fr.push('p' + r.page + ' y' + r2(r.y) + ': ' + r.text); });
   dbg.firstRows = fr;
@@ -377,6 +418,7 @@ function analyze(rawItems) {
   var cur = null;
   var lastRow = null;
   var startCount = 0;
+  var sample = [];
 
   function addItem(tx, it) {
     if (it.x >= moneyMinX) {
@@ -394,13 +436,16 @@ function analyze(rawItems) {
       cur = { date: row.items[di].text, valueDate: '', chq: '', left: [], parts: [], extras: [], money: [] };
       raw.push(cur);
       lastRow = row;
+
       var k;
       for (k = 0; k < di; k++) cur.left.push(row.items[k].text);
+
       var rest = row.items.slice(di + 1);
       var p = 0;
       if (rest[p] && DATE_RE.test(rest[p].text) && rest[p].x < moneyMinX) { cur.valueDate = rest[p].text; p++; }
       if (rest[p] && /^\d{6,12}$/.test(rest[p].text) && rest[p].x < moneyMinX) { cur.chq = rest[p].text; p++; }
       for (k = p; k < rest.length; k++) addItem(cur, rest[k]);
+
       if (sample.length < 4) {
         sample.push(row.items.map(function (it) {
           return it.text + '@' + r2(it.x) + (it.w ? '+' + r2(it.w) : '');
@@ -408,32 +453,40 @@ function analyze(rawItems) {
       }
       return;
     }
+
     if (!cur) return;
+
     if (row.page !== lastRow.page || (row.y - lastRow.y) > maxGap || STOP_RE.test(row.text) || isHeaderRow(row.text)) {
       cur = null;
       return;
     }
+
     row.items.forEach(function (it) {
       if (it.x < dateX - 0.5) cur.left.push(it.text);
       else addItem(cur, it);
     });
     lastRow = row;
   });
+
   dbg.startRows = startCount;
   dbg.sampleStartRows = sample;
 
   var recs = [];
   var skippedOpening = 0;
+
   raw.forEach(function (t) {
     var n = t.money.length;
     if (!n) return;
+
     var narrText = joinParts(t.parts.concat(t.extras));
     if (OPEN_RE.test(narrText.trim())) { skippedOpening++; return; }
+
     var rec = {
       date: t.date, valueDate: t.valueDate, chq: t.chq, ref: pickRef(t.left),
       narr: narrText,
       amt: null, bal: null, w: null, d: null, tok: null, hint: null
     };
+
     var m = t.money;
     if (n >= 3) {
       rec.w = Math.abs(num(m[n - 3].text));
@@ -447,12 +500,15 @@ function analyze(rawItems) {
       rec.amt = Math.abs(num(m[0].text));
       rec.tok = m[0];
     }
+
     if (rec.tok) {
       if (/cr\.?$/i.test(rec.tok.text)) rec.hint = 'd';
       else if (/dr\.?$/i.test(rec.tok.text)) rec.hint = 'w';
     }
+
     recs.push(rec);
   });
+
   dbg.skippedOpeningRows = skippedOpening;
 
   resolveSides(recs, dbg);
@@ -470,6 +526,7 @@ function analyze(rawItems) {
       balance: r.bal === null ? null : r2(r.bal)
     };
   });
+
   dbg.txCount = txs.length;
   return { info: extractInfo(rows, firstStart, txs), txs: txs, debug: dbg };
 }
@@ -525,23 +582,20 @@ function buildExcel(info, txs) {
       if (c >= 7) cell.numFmt = '#,##0.00';
     }
   });
+
   return wb.xlsx.writeBuffer();
 }
 
 /* ---------- Routes ---------- */
 function errMsg(e) {
   var s = '';
-  if (e && e.parserError) {
-    s = e.parserError.message ? e.parserError.message : String(e.parserError);
-  } else if (e && e.message) {
-    s = e.message;
-  } else if (typeof e === 'string') {
-    s = e;
-  } else {
-    try { s = JSON.stringify(e); } catch (x) { s = ''; }
-  }
+  if (e && e.parserError) s = e.parserError.message ? e.parserError.message : String(e.parserError);
+  else if (e && e.message) s = e.message;
+  else if (typeof e === 'string') s = e;
+  else { try { s = JSON.stringify(e); } catch (x) { s = ''; } }
+
   if (/password/i.test(s)) return 'PDF password galat hai ya password chahiye';
-  if (/compression|flate stream|bad xref|invalid pdf structure|unexpected end of file/i.test(s)) {
+  if (/compression|flate stream|bad xref|invalid pdf structure|unexpected end of file|fcheck/i.test(s)) {
     return 'Ye PDF file ka format non-standard/corrupt hai (shayad kisi unlock-tool se banayi gayi). PDF ko Chrome mein kholkar Print > Save as PDF karke naya file banao, phir usi ko upload karo.';
   }
   if (!s || s === '{}' || s === '[object Object]') {
@@ -583,87 +637,36 @@ app.post('/convert', upload.single('pdf'), function (req, res) {
   });
 });
 
-var TEST_PAGE = `<!DOCTYPE html>
-<html><head><meta charset="utf-8"><title>BankSync Test</title>
-<style>
-body{font-family:Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:20px}
-h2{color:#2ecc8f}
-input,button{padding:10px;margin:4px;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#e6edf3}
-button{background:#1b8a5a;border:0;cursor:pointer;font-weight:bold}
-table{border-collapse:collapse;width:100%;font-size:12px;margin-top:12px}
-th{background:#1b8a5a;color:#fff;padding:6px;position:sticky;top:0}
-td{border-bottom:1px solid #30363d;padding:5px;vertical-align:top}
-tr:nth-child(even) td{background:#161b22}
-.num{text-align:right;white-space:nowrap}
-textarea{width:100%;height:260px;background:#010409;color:#9ef0c4;border:1px solid #30363d;font-size:11px}
-#wrap{max-height:520px;overflow:auto}
-</style></head><body>
-<h2>BankSync Pro - Test Page</h2>
-<div>
-<input type="file" id="f" accept="application/pdf">
-<input type="password" id="pw" placeholder="PDF password (agar ho)">
-<button onclick="parseIt()">PARSE KARO</button>
-<button onclick="dl()">EXCEL DOWNLOAD</button>
-</div>
-<div id="st" style="margin:8px 4px"></div>
-<div id="info" style="margin:4px"></div>
-<div id="wrap"></div>
-<h3>Debug box</h3>
-<textarea id="dbg" readonly></textarea>
-<script>
-function esc(s){return String(s===null||s===undefined?'':s).replace(/&/g,'&amp;').replace(/</g,'&lt;');}
-function fmt(v){return v===null||v===undefined?'':Number(v).toLocaleString('en-IN',{minimumFractionDigits:2});}
-function post(path,type,done){
-  var f=document.getElementById('f').files[0];
-  if(!f){alert('Pehle PDF choose karo');return;}
-  var fd=new FormData();
-  fd.append('pdf',f);
-  var pw=document.getElementById('pw').value;
-  if(pw){fd.append('password',pw);}
-  var x=new XMLHttpRequest();
-  x.open('POST',path);
-  x.responseType=type;
-  x.onload=function(){done(x);};
-  x.onerror=function(){document.getElementById('st').textContent='Network error';};
-  x.send(fd);
-}
-function parseIt(){
-  var st=document.getElementById('st');
-  st.textContent='Parse ho raha hai... (pehli baar 30-60 sec lag sakte hain)';
-  post('/parse','json',function(x){
-    var r=x.response;
-    if(!r||x.status!==200){st.textContent='Error: '+(r&&r.error?r.error:x.status);return;}
-    show(r);
-  });
-}
-function show(r){
-  var t=r.transactions;
-  document.getElementById('st').textContent=t.length+' transactions mile';
-  var i=r.info;
-  document.getElementById('info').innerHTML='<b>Bank:</b> '+esc(i.bank)+' &nbsp; <b>Account:</b> '+esc(i.accountNo)+' &nbsp; <b>Period:</b> '+esc(i.period)+' &nbsp; <b>IFSC:</b> '+esc(i.ifsc)+' &nbsp; <b>MICR:</b> '+esc(i.micr);
-  var h='<table><tr><th>#</th><th>Date</th><th>Narration</th><th>Category</th><th>Ref</th><th>Chq</th><th>Value Date</th><th>Withdrawal</th><th>Deposit</th><th>Balance</th></tr>';
-  var k;
-  for(k=0;k<t.length;k++){
-    var a=t[k];
-    h+='<tr><td>'+(k+1)+'</td><td>'+esc(a.date)+'</td><td>'+esc(a.narration)+'</td><td>'+esc(a.category)+'</td><td>'+esc(a.ref)+'</td><td>'+esc(a.chq)+'</td><td>'+esc(a.valueDate)+'</td><td class="num">'+fmt(a.withdrawal)+'</td><td class="num">'+fmt(a.deposit)+'</td><td class="num">'+fmt(a.balance)+'</td></tr>';
-  }
-  h+='</table>';
-  document.getElementById('wrap').innerHTML=h;
-  document.getElementById('dbg').value=JSON.stringify({info:r.info,debug:r.debug},null,2);
-}
-function dl(){
-  var st=document.getElementById('st');
-  st.textContent='Excel ban raha hai...';
-  post('/convert','blob',function(x){
-    if(x.status!==200){st.textContent='Excel error: '+x.status;return;}
-    var url=URL.createObjectURL(x.response);
-    var a=document.createElement('a');
-    a.href=url;a.download='BankSync_Statement.xlsx';
-    document.body.appendChild(a);a.click();document.body.removeChild(a);
-    st.textContent='Excel download ho gaya';
-  });
-}
-</script></body></html>`;
+var TEST_PAGE = '<!DOCTYPE html><html><head><meta charset="utf-8"><title>BankSync Test</title>' +
+'<style>body{font-family:Arial,sans-serif;background:#0d1117;color:#e6edf3;margin:0;padding:20px}' +
+'h2{color:#2ecc8f}input,button{padding:10px;margin:4px;border-radius:6px;border:1px solid #30363d;background:#161b22;color:#e6edf3}' +
+'button{background:#1b8a5a;border:0;cursor:pointer;font-weight:bold}table{border-collapse:collapse;width:100%;font-size:12px;margin-top:12px}' +
+'th{background:#1b8a5a;color:#fff;padding:6px;position:sticky;top:0}td{border-bottom:1px solid #30363d;padding:5px;vertical-align:top}' +
+'tr:nth-child(even) td{background:#161b22}.num{text-align:right;white-space:nowrap}' +
+'textarea{width:100%;height:260px;background:#010409;color:#9ef0c4;border:1px solid #30363d;font-size:11px}#wrap{max-height:520px;overflow:auto}</style>' +
+'</head><body><h2>BankSync Pro - Test Page</h2><div>' +
+'<input type="file" id="f" accept="application/pdf">' +
+'<input type="password" id="pw" placeholder="PDF password (agar ho)">' +
+'<button onclick="parseIt()">PARSE KARO</button>' +
+'<button onclick="dl()">EXCEL DOWNLOAD</button></div>' +
+'<div id="st" style="margin:8px 4px"></div><div id="info" style="margin:4px"></div><div id="wrap"></div>' +
+'<h3>Debug box</h3><textarea id="dbg" readonly></textarea>' +
+'<script>' +
+'function esc(s){return String(s===null||s===undefined?\"\":s).replace(/&/g,\"&amp;\").replace(/</g,\"&lt;\");}' +
+'function fmt(v){return v===null||v===undefined?\"\":Number(v).toLocaleString(\"en-IN\",{minimumFractionDigits:2});}' +
+'function post(path,type,done){var f=document.getElementById(\"f\").files[0];if(!f){alert(\"Pehle PDF choose karo\");return;}' +
+'var fd=new FormData();fd.append(\"pdf\",f);var pw=document.getElementById(\"pw\").value;if(pw){fd.append(\"password\",pw);}var x=new XMLHttpRequest();' +
+'x.open(\"POST\",path);x.responseType=type;x.onload=function(){done(x);};x.onerror=function(){document.getElementById(\"st\").textContent=\"Network error\";};x.send(fd);}' +
+'function parseIt(){var st=document.getElementById(\"st\");st.textContent=\"Parse ho raha hai... (pehli baar 30-60 sec lag sakte hain)\";' +
+'post(\"/parse\",\"json\",function(x){var r=x.response;if(!r||x.status!==200){st.textContent=\"Error: \"+(r&&r.error?r.error:x.status);return;}show(r);});}' +
+'function show(r){var t=r.transactions;document.getElementById(\"st\").textContent=t.length+\" transactions mile\";var i=r.info;' +
+'document.getElementById(\"info\").innerHTML=\"<b>Bank:</b> \"+esc(i.bank)+\" &nbsp; <b>Account:</b> \"+esc(i.accountNo)+\" &nbsp; <b>Period:</b> \"+esc(i.period)+\" &nbsp; <b>IFSC:</b> \"+esc(i.ifsc)+\" &nbsp; <b>MICR:</b> \"+esc(i.micr);' +
+'var h=\"<table><tr><th>#</th><th>Date</th><th>Narration</th><th>Category</th><th>Ref</th><th>Chq</th><th>Value Date</th><th>Withdrawal</th><th>Deposit</th><th>Balance</th></tr>\";var k;' +
+'for(k=0;k<t.length;k++){var a=t[k];h+=\"<tr><td>\"+(k+1)+\"</td><td>\"+esc(a.date)+\"</td><td>\"+esc(a.narration)+\"</td><td>\"+esc(a.category)+\"</td><td>\"+esc(a.ref)+\"</td><td>\"+esc(a.chq)+\"</td><td>\"+esc(a.valueDate)+\"</td><td class=\\\"num\\\">\"+fmt(a.withdrawal)+\"</td><td class=\\\"num\\\">\"+fmt(a.deposit)+\"</td><td class=\\\"num\\\">\"+fmt(a.balance)+\"</td></tr>\";}' +
+'h+=\"</table>\";document.getElementById(\"wrap\").innerHTML=h;document.getElementById(\"dbg\").value=JSON.stringify({info:r.info,debug:r.debug},null,2);}' +
+'function dl(){var st=document.getElementById(\"st\");st.textContent=\"Excel ban raha hai...\";post(\"/convert\",\"blob\",function(x){if(x.status!==200){st.textContent=\"Excel error: \"+x.status;return;}' +
+'var url=URL.createObjectURL(x.response);var a=document.createElement(\"a\");a.href=url;a.download=\"BankSync_Statement.xlsx\";document.body.appendChild(a);a.click();document.body.removeChild(a);st.textContent=\"Excel download ho gaya\";});}' +
+'</script></body></html>';
 
 app.get('/test', function (req, res) { res.send(TEST_PAGE); });
 
