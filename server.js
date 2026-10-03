@@ -10,37 +10,15 @@ var upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 25 * 
 
 var MONEY_RE = /^\(?-?₹?\s?\d[\d,]*\.\d{2}\)?\s?(?:dr|cr)?\.?$/i;
 var DATE_RE = /^(?:\d{1,2}[-\/. ](?:\d{1,2}|[A-Za-z]{3,9})[-\/. ,']*\d{2,4}|\d{4}-\d{2}-\d{2})$/;
-var STACK_RE = /^\d{1,2}[-\/ ][A-Za-z]{3,9}[-\/ ]?$/;     // 01-Apr-
-var STACK_YMD_RE = /^\d{4}-\d{2}-$/;                    // 2026-02-
-var STOP_RE = /(generated on|page\s+\d+\s+of|closing balance|opening balance|statement summary|total\s+(debit|credit|withdrawal|deposit)|grand total|end of statement|computer generated|system generated|registered office|regd\.?\s*office|corporate identity number|cin\s*[:\-]|toll[- ]?free|customer care|grievance|disclaimer|e\.?\s?&\.?\s?o\.?\s?e\.?|terms and condition|subject to realisation|this is a (system|computer)|swift\s*code|www\.[a-z]|https?:\/\/|member.*deposit insurance|all disputes|jurisdiction|for any quer(y|ies)|legends?\s*:)/i;
-function looksLikeFooterRow(text) {
- var STOP_COMPACT_RE = /(statementsummary|generatedon|generatedby|requestingbranchcode|thisisacomputergeneratedstatement|doesnotrequiresignature|closingbalanceincludes|contentsofthisstatement|stateaccountbranchgstn|registeredofficeaddress|hdfcbanklimited)/i;
-
-function isStopRow(text) {
-  if (!text) return false;
-  if (STOP_RE.test(text)) return true;
-
-  // spaces hata ke check (HDFC jaise PDFs mein footer words chipke hote hain)
-  var compact = String(text).toLowerCase().replace(/\s+/g, '');
-  if (STOP_COMPACT_RE.test(compact)) return true;
-
-  return false;
-}
-  var s = String(text || '').toLowerCase().replace(/\s+/g, '');
-  if (!s) return false;
-
-  // HDFC footer (exactly page end pe aata hai)
-  if (s === 'hdfcbanklimited') return true;
-
-  // Common HDFC disclaimer blocks (spaces ke bina bhi aate hain)
-  if (s.indexOf('closingbalanceincludes') >= 0) return true;
-  if (s.indexOf('contentsofthisstatement') >= 0) return true;
-  if (s.indexOf('stateaccountbranchgstn') >= 0) return true;
-  if (s.indexOf('registeredofficeaddress') >= 0) return true;
-
-  return false;
-}
+var STACK_RE = /^\d{1,2}[-\/ ][A-Za-z]{3,9}[-\/ ]?$/;  // 01-Apr-
+var STACK_YMD_RE = /^\d{4}-\d{2}-$/;                 // 2026-02-
 var HDR_RE = /\b(s\.?\s?no|sl\.?\s?no|transaction|txn|date|cheque|chq|description|narration|particulars|details|withdrawals?|deposits?|debit|credit|balance|available|amount|ref|dr|cr)\b/gi;
+
+var STOP_RE = /(generated on|page\s+\d+\s+of|closing balance|opening balance|statement summary|statement of account|total\s+(debit|credit|withdrawal|deposit)|grand total|end of statement|computer generated|system generated|registered office|regd\.?\s*office|corporate identity number|cin\s*[:\-]|toll[- ]?free|customer care|grievance|disclaimer|e\.?\s?&\.?\s?o\.?\s?e\.?|terms and condition|subject to realisation|this is a (system|computer)|swift\s*code|www\.[a-z]|https?:\/\/|member.*deposit insurance|all disputes|jurisdiction|for any quer(y|ies)|legends?\s*:)/i;
+
+// spaces hata ke footer detect (HDFC me words chipke hote hain)
+var STOP_COMPACT_RE = /(statementsummary|generatedon|generatedby|requestingbranchcode|thisisacomputergeneratedstatement|doesnotrequiresignature|hdfcbanklimited|closingbalanceincludes|contentsofthisstatement|stateaccountbranchgstn|registeredofficeaddress)/i;
+
 var OPEN_RE = /^(brought\s*forward|balance\s*brought\s*forward|opening\s*balance|op\.?\s*bal\.?|b\/f\b|carried\s*forward|balance\s*carried\s*forward|c\/f\b)/i;
 
 function r2(x) { return Math.round(x * 100) / 100; }
@@ -58,6 +36,14 @@ function balOf(t) {
   var v = num(t);
   if (/dr\.?$/i.test(String(t).trim())) v = -Math.abs(v);
   return v;
+}
+
+function isStopRow(text) {
+  if (!text) return false;
+  if (STOP_RE.test(text)) return true;
+  var compact = String(text).toLowerCase().replace(/\s+/g, '');
+  if (STOP_COMPACT_RE.test(compact)) return true;
+  return false;
 }
 
 /* ---------- PDF read ---------- */
@@ -85,8 +71,8 @@ function readItems(buffer, password) {
 }
 
 /* date split join:
-   01-Apr- + 2026
-   2026-02- + 14
+   01-Apr- + 2026  => 01-Apr-2026
+   2026-02- + 14   => 2026-02-14
 */
 function stackDates(items) {
   var used = {};
@@ -103,7 +89,6 @@ function stackDates(items) {
   for (i = 0; i < items.length; i++) {
     var a = items[i];
 
-    // Case A: 01-Apr- + 2026
     if (STACK_RE.test(a.text)) {
       for (j = 0; j < items.length; j++) {
         var b1 = items[j];
@@ -119,7 +104,6 @@ function stackDates(items) {
       continue;
     }
 
-    // Case B: 2026-02- + 14  => 2026-02-14
     if (STACK_YMD_RE.test(a.text)) {
       for (j = 0; j < items.length; j++) {
         var b2 = items[j];
@@ -128,7 +112,6 @@ function stackDates(items) {
         var dy2 = b2.y - a.y;
         if (dy2 < 0.2 || dy2 > 1.8) continue;
         if (!closeX(a, b2)) continue;
-
         var dd = b2.text.length === 1 ? ('0' + b2.text) : b2.text;
         a.text = a.text + dd;
         used[j] = true;
@@ -350,10 +333,11 @@ var IFSC_BANK = {
 };
 
 function extractInfo(rows, firstStart, txs) {
-  var headRows = firstStart > 0 ? rows.slice(0, firstStart) : rows.slice(0, 60);
+  var headRows = firstStart > 0 ? rows.slice(0, firstStart) : rows.slice(0, 80);
   var head = headRows.map(function (r) { return r.text; }).join('\n');
   var info = { bank: 'Unknown', accountNo: '', period: '', ifsc: '', micr: '' };
 
+  // IFSC (word boundary mat rakho, HDFC me chipka hota hai)
   var m = head.match(/([A-Z]{4}0[A-Z0-9]{6})/);
   if (m) {
     info.ifsc = m[1];
@@ -458,6 +442,7 @@ function analyze(rawItems) {
 
   rows.forEach(function (row) {
     var di = dateIdx(row, dateX);
+
     if (di >= 0) {
       startCount++;
       cur = { date: row.items[di].text, valueDate: '', chq: '', left: [], parts: [], extras: [], money: [] };
@@ -484,9 +469,9 @@ function analyze(rawItems) {
     if (!cur) return;
 
     if (row.page !== lastRow.page || (row.y - lastRow.y) > maxGap || isStopRow(row.text) || isHeaderRow(row.text)) {
-  cur = null;
-  return;
-}
+      cur = null;
+      return;
+    }
 
     row.items.forEach(function (it) {
       if (it.x < dateX - 0.5) cur.left.push(it.text);
