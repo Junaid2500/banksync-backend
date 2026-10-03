@@ -14,6 +14,18 @@ var STACK_RE = /^\d{1,2}[-\/ ][A-Za-z]{3,9}[-\/ ]?$/;     // 01-Apr-
 var STACK_YMD_RE = /^\d{4}-\d{2}-$/;                    // 2026-02-
 var STOP_RE = /(generated on|page\s+\d+\s+of|closing balance|opening balance|statement summary|total\s+(debit|credit|withdrawal|deposit)|grand total|end of statement|computer generated|system generated|registered office|regd\.?\s*office|corporate identity number|cin\s*[:\-]|toll[- ]?free|customer care|grievance|disclaimer|e\.?\s?&\.?\s?o\.?\s?e\.?|terms and condition|subject to realisation|this is a (system|computer)|swift\s*code|www\.[a-z]|https?:\/\/|member.*deposit insurance|all disputes|jurisdiction|for any quer(y|ies)|legends?\s*:)/i;
 function looksLikeFooterRow(text) {
+ var STOP_COMPACT_RE = /(statementsummary|generatedon|generatedby|requestingbranchcode|thisisacomputergeneratedstatement|doesnotrequiresignature|closingbalanceincludes|contentsofthisstatement|stateaccountbranchgstn|registeredofficeaddress|hdfcbanklimited)/i;
+
+function isStopRow(text) {
+  if (!text) return false;
+  if (STOP_RE.test(text)) return true;
+
+  // spaces hata ke check (HDFC jaise PDFs mein footer words chipke hote hain)
+  var compact = String(text).toLowerCase().replace(/\s+/g, '');
+  if (STOP_COMPACT_RE.test(compact)) return true;
+
+  return false;
+}
   var s = String(text || '').toLowerCase().replace(/\s+/g, '');
   if (!s) return false;
 
@@ -471,7 +483,7 @@ function analyze(rawItems) {
 
     if (!cur) return;
 
-    if (row.page !== lastRow.page || (row.y - lastRow.y) > maxGap || STOP_RE.test(row.text) || isHeaderRow(row.text) || looksLikeFooterRow(row.text)) {
+    if (row.page !== lastRow.page || (row.y - lastRow.y) > maxGap || isStopRow(row.text) || isHeaderRow(row.text)) {
   cur = null;
   return;
 }
